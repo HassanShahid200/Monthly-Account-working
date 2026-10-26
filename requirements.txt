@@ -1,0 +1,11 @@
+streamlit
+
+pandas
+
+openpyxl
+
+xlrd
+
+streamlit-aggrid
+
+numpy
