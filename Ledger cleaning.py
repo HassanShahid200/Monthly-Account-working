@@ -25,7 +25,7 @@ def normalize_code(series):
 def load_data(content, filename):
     ext = filename.split('.')[-1].lower()
     if ext == 'txt':
-        df = pd.read_csv(BytesIO(content), sep="\t", encoding="utf-16", low_memory=False)
+        df = pd.read_csv(BytesIO(content), sep="	", encoding="utf-16", low_memory=False)
     elif ext == 'csv':
         df = pd.read_csv(BytesIO(content), low_memory=False)
     else:
@@ -131,24 +131,28 @@ def save_report_snapshot(content, filename, title, comments, period):
     client.table('ledger_reports').insert(payload).execute()
     return token
 
-def merge_comments(returned, valid_paths, comments):
-    if not isinstance(returned, pd.DataFrame) or not {'_path', 'Comments'}.issubset(returned.columns):
-        return
-    valid = set(valid_paths)
-    for _, row in returned.iterrows():
-        path = row['_path']
-        if path in valid:
-            value = row['Comments']
-            text = '' if pd.isna(value) else str(value)[:4000]
-            if text:
-                comments[path] = text
-            else:
-                comments.pop(path, None)
-
 def run():
     st.set_page_config(layout='wide', page_title='Financial Dashboard')
     st.title('SAP Financial Ledger Dashboard')
     
+    # Password Protection Logic
+    expected_password = str(st.secrets.get('EDITOR_PASSWORD', ''))
+    if expected_password:
+        if not st.session_state.get('authenticated'):
+            st.info("This dashboard is protected. Please log in.")
+            password = st.text_input("Enter Editor Password", type="password")
+            if st.button("Login"):
+                if password == expected_password:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password!")
+            return
+            
+    if st.sidebar.button("Logout"):
+        st.session_state.authenticated = False
+        st.rerun()
+        
     for key, default in [('expanded', set()), ('draft_comments', {}), ('ledger_path', None)]:
         st.session_state.setdefault(key, default)
 
@@ -322,7 +326,20 @@ def run():
                           }'''))
 
         returned = response.data
-        merge_comments(returned, table['_path'], comments)
+        
+        # Extract comments
+        if isinstance(returned, pd.DataFrame) and {'_path', 'Comments'}.issubset(returned.columns):
+            valid = set(table['_path'])
+            for _, row in returned.iterrows():
+                path = row['_path']
+                if path in valid:
+                    val = row['Comments']
+                    text = '' if pd.isna(val) else str(val)[:4000]
+                    if text:
+                        st.session_state.draft_comments[path] = text
+                    else:
+                        st.session_state.draft_comments.pop(path, None)
+
         if isinstance(returned, pd.DataFrame) and '_expanded' in returned.columns:
             states = returned['_expanded'].dropna()
             states = states.loc[states.ne('')]
@@ -332,17 +349,16 @@ def run():
         st.divider()
         st.subheader("3. Save to Cloud")
         title = st.text_input('Report title', value='2026 vs 2025 Financial Report')
-        base_url = st.text_input('Your Streamlit app URL (optional)', placeholder='https://your-app.streamlit.app')
         
         if st.button('Save & Share Report', type='primary'):
             try:
-                base_url = base_url or "https://example.streamlit.app"
+                base_url = str(st.secrets.get('APP_URL', 'https://example.streamlit.app'))
                 with st.spinner('Saving workbook and comments online...'):
-                    share_token = save_report_snapshot(content, filename, title, comments, 'all')
+                    share_token = save_report_snapshot(content, filename, title, st.session_state.draft_comments, 'all')
                 st.success('Report saved successfully!')
                 st.code(f"{base_url}?report={share_token}")
             except Exception as exc:
-                st.error(f'Save failed: Make sure Supabase secrets are set in Streamlit. Error: {exc}')
+                st.error(f'Save failed: {exc}')
 
     except Exception as exc:
         st.error(f'Unable to process: {exc}')
