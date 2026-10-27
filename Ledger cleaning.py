@@ -14,9 +14,7 @@ ORDER = [
     'Other operating expenses', 'Finance Costs', 'Taxation'
 ]
 MAIN, SUB, CODE = 'Current Main Class', 'Current Sub Class', 'Acct Code'
-AMOUNT = 'Deb./Cred. (LC)'
 REQUIRED_COLUMNS = {"Series", "Due Date", "Remarks", "Doc. No."}
-DEFAULT_COLUMNS = ["Acct Code", "Acct Name", "Posting Date", "Origin", "Doc No", "Remarks", "Offset Acct", "Offset Acct Name", "Deb./Cred. (LC)", "Deb./Cred. (FC)", "Balance Due (LC)"]
 
 def normalize_code(series):
     return series.astype('string').str.strip().str.replace(r'\.0$', '', regex=True).replace('', pd.NA)
@@ -45,20 +43,10 @@ def load_data(content, filename):
         df["Origin"] = parts[0]
         df["Doc No"] = parts[1]
 
-    ordered = [c for c in DEFAULT_COLUMNS if c in df.columns]
-    ordered += [c for c in df.columns if c not in ordered]
-    df = df.reindex(columns=ordered)
-    
-    df[CODE] = normalize_code(df[CODE])
+    df[CODE] = normalize_code(df.get("Acct Code", pd.Series()))
     if df[CODE].isna().any():
         df = df.dropna(subset=[CODE])
 
-    if "Posting Date" in df.columns:
-        dates = pd.to_datetime(df['Posting Date'], errors='coerce')
-        df['Posting Date'] = dates
-        
-    amounts = pd.to_numeric(df.get(AMOUNT, df.get('Deb./Cred. (FC)')), errors='coerce').fillna(0)
-    df[AMOUNT] = amounts
     return df
 
 @st.cache_data
@@ -81,21 +69,25 @@ def load_mapping(content, filename):
         
     return df[['Account code', MAIN, SUB, 'Title']].dropna(subset=['Account code'])
 
-def filter_by_date(df, start_date, end_date):
+def filter_by_date(df, date_col, start_date, end_date):
     mask = pd.Series(True, index=df.index)
     if start_date:
-        mask &= (df['Posting Date'].dt.date >= pd.to_datetime(start_date).date())
+        mask &= (df[date_col].dt.date >= pd.to_datetime(start_date).date())
     if end_date:
-        mask &= (df['Posting Date'].dt.date <= pd.to_datetime(end_date).date())
+        mask &= (df[date_col].dt.date <= pd.to_datetime(end_date).date())
     return df[mask]
 
-def visible_rows(summary, expanded, col1_name, col2_name):
+def visible_rows(summary, expanded, col1_name, col2_name, formula_choice):
     rows, paths = [], []
     def append_row(part, path, label):
         old, new = float(part[col1_name].sum()), float(part[col2_name].sum())
-        change = (new - old) / new if new != 0 else None
         
-        marker = ('− ' if path in expanded else '+ ') if len(path) < 3 else ''
+        if formula_choice == "(Col 2 - Col 1) / Col 2":
+            change = (new - old) / new if new != 0 else None
+        else:
+            change = (new - old) / old if old != 0 else None
+            
+        marker = ('  ' if path in expanded else '+ ') if len(path) < 3 else ''
         if len(path) < 3:
             count = part[CODE].nunique()
             label = f'{label} ({count} {"account" if count == 1 else "accounts"})'
@@ -142,7 +134,7 @@ def fetch_shared_report(token):
     content = client.storage.from_(bucket).download(report['file_path'])
     return report, content
 
-def save_report_snapshot(df, title, comments, col1_config, col2_config):
+def save_report_snapshot(df, title, comments, col1_config, col2_config, sel_date, sel_amt, formula_choice):
     client = cloud_client()
     if not client:
         raise ValueError("Supabase credentials not found in secrets.")
@@ -162,7 +154,10 @@ def save_report_snapshot(df, title, comments, col1_config, col2_config):
         'id': report_id, 'title': title.strip() or 'Financial Report',
         'file_path': path, 'original_filename': 'mapped_ledger.xlsx',
         'comments': dict(comments), 
-        'reporting_period': json.dumps({'col1': col1_config, 'col2': col2_config}),
+        'reporting_period': json.dumps({
+            'col1': col1_config, 'col2': col2_config, 
+            'sel_date': sel_date, 'sel_amt': sel_amt, 'formula': formula_choice
+        }),
         'share_token_hash': token_digest(token)
     }
     client.table('ledger_reports').insert(payload).execute()
@@ -207,14 +202,19 @@ def run():
             st.caption('Shared report - View only mode (Comments cannot be edited)')
             
             df = pd.read_excel(BytesIO(content))
-            if 'Posting Date' in df.columns:
-                df['Posting Date'] = pd.to_datetime(df['Posting Date'], errors='coerce')
-                
+            
             st.session_state.draft_comments = report_meta.get('comments', {})
             configs = json.loads(report_meta['reporting_period'])
+            
             col1_config = configs.get('col1', {'name': '2025', 'start': None, 'end': None})
             col2_config = configs.get('col2', {'name': '2026', 'start': None, 'end': None})
+            sel_date = configs.get('sel_date', 'Posting Date')
+            sel_amt = configs.get('sel_amt', 'Deb./Cred. (LC)')
+            formula_choice = configs.get('formula', '(Col 2 - Col 1) / Col 2')
             
+            if sel_date in df.columns:
+                df[sel_date] = pd.to_datetime(df[sel_date], errors='coerce')
+                
             mode = "Shared View"
             read_only_mode = True
         except Exception as e:
@@ -247,6 +247,9 @@ def run():
         df = pd.DataFrame()
         col1_config = {'name': '2025', 'start': None, 'end': None}
         col2_config = {'name': '2026', 'start': None, 'end': None}
+        sel_date = 'Posting Date'
+        sel_amt = 'Deb./Cred. (LC)'
+        formula_choice = '(Col 2 - Col 1) / Col 2'
         
         if mode == "Create New Report (Upload Data)":
             st.header("1. Upload Data")
@@ -267,16 +270,33 @@ def run():
                 st.warning('Could not load data. Ensure files are not empty.')
                 return
                 
+            st.header("2. Column Settings")
+            date_options = [c for c in raw_df.columns if 'date' in c.lower()]
+            amt_options = [c for c in raw_df.columns if 'LC' in c or 'FC' in c or pd.api.types.is_numeric_dtype(raw_df[c])]
+            
+            c_date, c_amt = st.columns(2)
+            sel_date = c_date.selectbox("Select Date Column", raw_df.columns, index=raw_df.columns.get_loc(date_options[0]) if date_options else 0)
+            sel_amt = c_amt.selectbox("Select Amount Column", raw_df.columns, index=raw_df.columns.get_loc(amt_options[0]) if amt_options else 0)
+                
             df = pd.merge(raw_df, mapping_df, left_on=CODE, right_on='Account code', how='inner')
             if df.empty:
                 st.error('No matching accounts found between the raw ledger and your mapping file.')
                 return
-                
-            df[AMOUNT] = df[AMOUNT] * -1
+            
+            # Clean chosen amount and date columns
+            df[sel_date] = pd.to_datetime(df[sel_date], errors='coerce')
+            if df[sel_amt].dtype == 'object':
+                df[sel_amt] = pd.to_numeric(df[sel_amt].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+            else:
+                df[sel_amt] = pd.to_numeric(df[sel_amt], errors='coerce').fillna(0)
+            
+            # Multiply by -1 for P&L logic
+            df[sel_amt] = df[sel_amt] * -1
+            
             st.success(f"Matched {df[CODE].nunique()} unique accounts. Total transactions: {len(df)}")
             
-            st.header("2. Calculation Settings")
-            c1, c2 = st.columns(2)
+            st.header("3. Calculation Settings")
+            c1, c2, c3 = st.columns(3)
             with c1:
                 st.subheader("Column 1 Setup")
                 c1_name = st.text_input("Column 1 Name", value="2025")
@@ -287,11 +307,17 @@ def run():
                 c2_name = st.text_input("Column 2 Name", value="2026")
                 c2_start = st.date_input("Start Date (Col 2)", value=None, key='c2s')
                 c2_end = st.date_input("End Date (Col 2)", value=None, key='c2e')
+            with c3:
+                st.subheader("Formula Setup")
+                formula_choice = st.selectbox("Select % Change Formula", [
+                    "(Col 2 - Col 1) / Col 2",
+                    "(Col 2 - Col 1) / Col 1"
+                ])
                 
             col1_config = {'name': c1_name, 'start': c1_start, 'end': c1_end}
             col2_config = {'name': c2_name, 'start': c2_start, 'end': c2_end}
 
-            st.info(f"Percentage Change Formula: **({c2_name} - {c1_name}) / {c2_name}**")
+            st.info(f"Selected Formula: **{formula_choice}**")
             if not st.button("Generate Report", type='primary') and not st.session_state.get('report_generated'):
                 return
             st.session_state.report_generated = True
@@ -317,16 +343,24 @@ def run():
                             configs = json.loads(report_meta['reporting_period'])
                             st.session_state.loaded_col1_config = configs.get('col1')
                             st.session_state.loaded_col2_config = configs.get('col2')
+                            st.session_state.loaded_sel_date = configs.get('sel_date', 'Posting Date')
+                            st.session_state.loaded_sel_amt = configs.get('sel_amt', 'Deb./Cred. (LC)')
+                            st.session_state.loaded_formula = configs.get('formula', '(Col 2 - Col 1) / Col 2')
                         except:
                             pass
                             
             if 'loaded_df' in st.session_state:
                 df = st.session_state.loaded_df
-                df['Posting Date'] = pd.to_datetime(df['Posting Date'], errors='coerce')
+                sel_date = st.session_state.get('loaded_sel_date', sel_date)
+                sel_amt = st.session_state.get('loaded_sel_amt', sel_amt)
+                
+                if sel_date in df.columns:
+                    df[sel_date] = pd.to_datetime(df[sel_date], errors='coerce')
                 st.success("Report loaded successfully!")
                 
                 col1_config = st.session_state.get('loaded_col1_config', col1_config)
                 col2_config = st.session_state.get('loaded_col2_config', col2_config)
+                formula_choice = st.session_state.get('loaded_formula', formula_choice)
             else:
                 return
 
@@ -336,11 +370,11 @@ def run():
     col1_name = col1_config['name']
     col2_name = col2_config['name']
     
-    df_col1 = filter_by_date(df, col1_config['start'], col1_config['end'])
-    df_col2 = filter_by_date(df, col2_config['start'], col2_config['end'])
+    df_col1 = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
+    df_col2 = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
     
-    col1_totals = df_col1.groupby(CODE)[AMOUNT].sum()
-    col2_totals = df_col2.groupby(CODE)[AMOUNT].sum()
+    col1_totals = df_col1.groupby(CODE)[sel_amt].sum()
+    col2_totals = df_col2.groupby(CODE)[sel_amt].sum()
     
     summary = df[[MAIN, SUB, CODE, 'Title']].drop_duplicates()
     summary[col1_name] = summary[CODE].map(col1_totals).fillna(0)
@@ -352,7 +386,7 @@ def run():
     
     all_branches = {(m,) for m in summary[MAIN].unique()}
     all_branches.update(tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
-    table, paths = visible_rows(summary, all_branches, col1_name, col2_name)
+    table, paths = visible_rows(summary, all_branches, col1_name, col2_name, formula_choice)
     
     comments = st.session_state.draft_comments
     table['Comments'] = table['_path'].map(comments).fillna('')
@@ -377,7 +411,7 @@ def run():
                     const button = document.createElement('button');
                     button.type = 'button';
                     button.textContent = label;
-                    button.style.cssText = 'cursor:pointer;padding:4px 12px;border:1px solid #a7bbce;border-radius:5px;background:#ffffff;color:#17324d;font-size:13px;';
+                    button.style.cssText = 'cursor:pointer;padding:4px 12px;border:1px solid #a7bbce;border-radius:5px;background:#ffffff;color:#17324d;font-size:13px;font-weight:bold;';
                     button.addEventListener('click', (event) => {
                         event.stopPropagation();
                         const opened = [];
@@ -410,7 +444,9 @@ def run():
                     button.type = 'button';
                     const isOpen = (window.__ledgerExpanded || []).includes(p.data._path);
                     button.textContent = isOpen ? '−' : '+';
-                    button.style.cssText = 'cursor:pointer;width:26px;height:26px;margin-right:9px;border:1px solid currentColor;border-radius:5px;background:transparent;';
+                    // EXPLICIT COLOR FIX: White for Level 1 (dark blue bg), Dark Blue for Level 2 (light bg)
+                    const btnColor = p.data._level === 1 ? '#ffffff' : '#17324d';
+                    button.style.cssText = 'cursor:pointer;width:24px;height:24px;margin-right:9px;border:1.5px solid ' + btnColor + ';border-radius:4px;background:transparent;color:' + btnColor + ';font-weight:bold;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;';
                     button.addEventListener('click', function(e) {
                         e.stopPropagation();
                         const key = p.data._path;
@@ -449,13 +485,18 @@ def run():
                         cellEditorParams={'maxLength': 4000, 'rows': 5, 'cols': 45})
                         
     total_new, total_old = float(summary[col2_name].sum()), float(summary[col1_name].sum())
+    
+    if formula_choice == "(Col 2 - Col 1) / Col 2":
+        total_change = (total_new - total_old) / total_new if total_new else None
+    else:
+        total_change = (total_new - total_old) / total_old if total_old else None
+
     gb.configure_grid_options(
         headerHeight=78,
         stopEditingWhenCellsLoseFocus=True,
         getRowId=JsCode("function(p) { return p.data._path; }"),
         pinnedBottomRowData=[{'Hierarchy': 'Grand Total', col2_name: total_new,
-                              col1_name: total_old,
-                              '% Change': (total_new - total_old) / total_new if total_new else None}],
+                              col1_name: total_old, '% Change': total_change}],
         context={'expanded': [json.dumps(path, ensure_ascii=False, separators=(',', ':'))
                               for path in sorted(st.session_state.expanded)]},
         isExternalFilterPresent=JsCode('function() { return true; }'),
@@ -550,17 +591,16 @@ def run():
         
         st.write(f"**Selected scope:** {' → '.join(path)}")
         
-        # Make sure the state is valid
         if st.session_state.ledger_col not in [col2_name, col1_name]:
             st.session_state.ledger_col = col2_name
             
         selected_col = st.radio('Select the ledger period to view:', [col2_name, col1_name], horizontal=True, key='ledger_col')
         
         if selected_col == col1_name:
-            detail = filter_by_date(df, col1_config['start'], col1_config['end'])
+            detail = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
             period_label = col1_name
         else:
-            detail = filter_by_date(df, col2_config['start'], col2_config['end'])
+            detail = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
             period_label = col2_name
         
         mask = detail[MAIN].eq(path[0])
@@ -569,36 +609,38 @@ def run():
         
         detail = detail.loc[mask].copy()
         
-        if 'Posting Date' in detail.columns:
-            detail = detail.sort_values('Posting Date')
+        if sel_date in detail.columns:
+            detail = detail.sort_values(sel_date)
         
         a, b = st.columns(2)
         a.metric(f'Transactions · {period_label}', len(detail))
-        b.metric('Mapped Net Amount (After -1)', f'{detail[AMOUNT].sum():,.2f}')
+        b.metric('Mapped Net Amount (After -1)', f'{detail[sel_amt].sum():,.2f}')
         
-        detail['Debit'] = detail[AMOUNT].clip(lower=0)
-        detail['Credit'] = -detail[AMOUNT].clip(upper=0)
+        original_amt = detail[sel_amt] * -1 
+        detail['Debit'] = original_amt.clip(lower=0)
+        detail['Credit'] = -original_amt.clip(upper=0)
+        
         st.caption('Net = Debit − Credit.')
         
-        columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', 'Posting Date', 'Origin', 'Doc No',
-                   'Remarks', 'Offset Acct', 'Offset Acct Name', 'Debit', 'Credit', AMOUNT]
+        columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', sel_date, 'Origin', 'Doc No',
+                   'Remarks', 'Offset Acct', 'Offset Acct Name', 'Debit', 'Credit', sel_amt]
         detail = detail[[col for col in columns if col in detail.columns]].copy()
         
-        if 'Posting Date' in detail.columns:
-            detail['Posting Date'] = detail['Posting Date'].dt.strftime('%Y-%m-%d')
+        if sel_date in detail.columns:
+            detail[sel_date] = detail[sel_date].dt.strftime('%Y-%m-%d')
             
         if detail.empty:
             st.info('No transactions were found for this selection and period.')
         else:
             total_row = {col: '' for col in detail.columns}
             total_row[CODE] = 'Grand Total'
-            for col in ['Debit', 'Credit', AMOUNT]:
+            for col in ['Debit', 'Credit', sel_amt]:
                 total_row[col] = float(detail[col].sum())
                 
             detail = pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
             st.dataframe(detail, use_container_width=True, hide_index=True,
                          column_config={col: st.column_config.NumberColumn(format='%.2f')
-                                        for col in ['Debit', 'Credit', AMOUNT]})
+                                        for col in ['Debit', 'Credit', sel_amt]})
             
             st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
                                file_name=f'ledger_{period_label}.csv', mime='text/csv')
@@ -622,7 +664,8 @@ def run():
                     with st.spinner('Saving workbook and comments online...'):
                         share_token = save_report_snapshot(df, title, st.session_state.draft_comments, 
                                                            {'name': col1_name, 'start': str(col1_config['start']) if col1_config['start'] else None, 'end': str(col1_config['end']) if col1_config['end'] else None}, 
-                                                           {'name': col2_name, 'start': str(col2_config['start']) if col2_config['start'] else None, 'end': str(col2_config['end']) if col2_config['end'] else None})
+                                                           {'name': col2_name, 'start': str(col2_config['start']) if col2_config['start'] else None, 'end': str(col2_config['end']) if col2_config['end'] else None},
+                                                           sel_date, sel_amt, formula_choice)
                     st.success('Report saved successfully!')
                     st.code(report_link(base_url_input, share_token))
             except Exception as exc:
