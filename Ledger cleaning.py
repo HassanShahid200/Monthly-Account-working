@@ -184,6 +184,27 @@ def report_link(base_url, token):
 def run():
     st.set_page_config(layout='wide', page_title='Financial Dashboard')
     
+    # ========================================================
+    # GITHUB ICON AUR STREAMLIT MENU HIDE KARNE KA CODE
+    # ========================================================
+    hide_streamlit_style = """
+    <style>
+    /* GitHub icon, Main Menu aur Footer hide karne ke liye */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    .viewerBadge_container__1QSob {display: none !important;}
+    .viewerBadge_link__1S137 {display: none !important;}
+    .viewerBadge_text__1JaDK {display: none !important;}
+    
+    /* Naye Streamlit versions ke liye */
+    [data-testid="stToolbar"] {visibility: hidden;}
+    [data-testid="stDecoration"] {display: none;}
+    [data-testid="stStatusWidget"] {visibility: hidden;}
+    </style>
+    """
+    st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+    # ========================================================
+    
     for key, default in [('expanded', set()), ('draft_comments', {}), ('ledger_path', None), ('ledger_col', None), ('handled_action', None)]:
         st.session_state.setdefault(key, default)
 
@@ -659,14 +680,4 @@ def run():
                     st.error("Please enter a valid APP_URL starting with https://")
                 else:
                     with st.spinner('Saving workbook and comments online...'):
-                        share_token = save_report_snapshot(df, title, st.session_state.draft_comments, 
-                                                           {'name': col1_name, 'start': str(col1_config['start']) if col1_config['start'] else None, 'end': str(col1_config['end']) if col1_config['end'] else None}, 
-                                                           {'name': col2_name, 'start': str(col2_config['start']) if col2_config['start'] else None, 'end': str(col2_config['end']) if col2_config['end'] else None},
-                                                           sel_date, sel_amt, formula_choice)
-                    st.success('Report saved successfully!')
-                    st.code(report_link(base_url_input, share_token))
-            except Exception as exc:
-                st.error(f'Save failed: {exc}')
-
-if __name__ == '__main__':
-    run()
+                        share_token = save_report_snapshot
