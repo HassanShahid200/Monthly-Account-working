@@ -87,12 +87,12 @@ def visible_rows(summary, expanded, col1_name, col2_name, formula_choice):
         else:
             change = (new - old) / old if old != 0 else None
             
-        marker = ('  ' if path in expanded else '+ ') if len(path) < 3 else ''
         if len(path) < 3:
             count = part[CODE].nunique()
             label = f'{label} ({count} {"account" if count == 1 else "accounts"})'
         
-        rows.append({'Hierarchy': '    ' * (len(path) - 1) + marker + label,
+        # FIXED: Removed the python-side 'marker' (+/-) completely so JavaScript doesn't slice actual text!
+        rows.append({'Hierarchy': label,
                      col2_name: new, col1_name: old, '% Change': change,
                      '_level': len(path), '_path': json.dumps(path, ensure_ascii=False, separators=(',', ':')),
                      '_expanded': '', '_action': '', '_id': len(paths)})
@@ -283,14 +283,12 @@ def run():
                 st.error('No matching accounts found between the raw ledger and your mapping file.')
                 return
             
-            # Clean chosen amount and date columns
             df[sel_date] = pd.to_datetime(df[sel_date], errors='coerce')
             if df[sel_amt].dtype == 'object':
                 df[sel_amt] = pd.to_numeric(df[sel_amt].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
             else:
                 df[sel_amt] = pd.to_numeric(df[sel_amt], errors='coerce').fillna(0)
             
-            # Multiply by -1 for P&L logic
             df[sel_amt] = df[sel_amt] * -1
             
             st.success(f"Matched {df[CODE].nunique()} unique accounts. Total transactions: {len(df)}")
@@ -444,9 +442,10 @@ def run():
                     button.type = 'button';
                     const isOpen = (window.__ledgerExpanded || []).includes(p.data._path);
                     button.textContent = isOpen ? '−' : '+';
-                    // EXPLICIT COLOR FIX: White for Level 1 (dark blue bg), Dark Blue for Level 2 (light bg)
+                    
                     const btnColor = p.data._level === 1 ? '#ffffff' : '#17324d';
                     button.style.cssText = 'cursor:pointer;width:24px;height:24px;margin-right:9px;border:1.5px solid ' + btnColor + ';border-radius:4px;background:transparent;color:' + btnColor + ';font-weight:bold;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;';
+                    
                     button.addEventListener('click', function(e) {
                         e.stopPropagation();
                         const key = p.data._path;
@@ -466,7 +465,8 @@ def run():
                     this.el.appendChild(button);
                 }
                 const text = document.createElement('span');
-                text.textContent = p.data._level < 3 ? label.slice(2) : label;
+                // FIXED BUG: Do not slice the text anymore. 
+                text.textContent = label;
                 this.el.appendChild(text);
             }
             getGui() { return this.el; }
