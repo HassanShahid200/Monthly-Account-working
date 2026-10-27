@@ -548,10 +548,15 @@ def run():
         st.divider()
         st.subheader('Ledger Details')
         
-        clicked_col = st.session_state.ledger_col
         st.write(f"**Selected scope:** {' → '.join(path)}")
         
-        if clicked_col == col1_name:
+        # Make sure the state is valid
+        if st.session_state.ledger_col not in [col2_name, col1_name]:
+            st.session_state.ledger_col = col2_name
+            
+        selected_col = st.radio('Select the ledger period to view:', [col2_name, col1_name], horizontal=True, key='ledger_col')
+        
+        if selected_col == col1_name:
             detail = filter_by_date(df, col1_config['start'], col1_config['end'])
             period_label = col1_name
         else:
@@ -606,7 +611,6 @@ def run():
         st.subheader("5. Save to Cloud")
         title = st.text_input('Report title', value=f'{col2_name} vs {col1_name} Financial Report')
         
-        # Verify URL Box added here so you can confirm it is 100% correct before saving.
         default_url = str(st.secrets.get('APP_URL', ''))
         base_url_input = st.text_input('Verify your App URL (Must start with https://):', value=default_url)
         
