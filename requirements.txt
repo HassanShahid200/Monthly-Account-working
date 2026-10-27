@@ -1,11 +1,5 @@
-streamlit
-
-pandas
-
-openpyxl
-
-xlrd
-
-streamlit-aggrid
-
-numpy
+streamlit>=1.20.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+st-aggrid>=0.3.0
+supabase>=2.0.0
