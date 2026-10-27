@@ -133,7 +133,7 @@ def token_digest(token):
 
 def fetch_shared_report(token):
     client = cloud_client()
-    if not client: raise ValueError("Database connection failed.")
+    if not client: raise ValueError("Database connection failed. Check SUPABASE_URL and SUPABASE_SECRET_KEY.")
     records = client.table('ledger_reports').select('*').eq('share_token_hash', token_digest(token)).limit(1).execute().data
     if not records:
         raise ValueError('This report link is invalid or has expired.')
@@ -184,7 +184,7 @@ def load_saved_report(report_id):
 def report_link(base_url, token):
     parsed = urlsplit(base_url.strip())
     if not parsed.netloc:
-        raise ValueError("Invalid APP_URL. Make sure it includes https://")
+        raise ValueError("Invalid APP_URL. Make sure it starts with https://")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or '/', urlencode({'report': token}), ''))
 
 def run():
@@ -204,7 +204,7 @@ def run():
             report_meta, content = fetch_shared_report(report_token)
             st.title('SAP Financial Ledger Dashboard')
             st.subheader(report_meta['title'])
-            st.caption('Shared report · View only mode (Comments cannot be edited)')
+            st.caption('Shared report - View only mode (Comments cannot be edited)')
             
             df = pd.read_excel(BytesIO(content))
             if 'Posting Date' in df.columns:
@@ -606,18 +606,21 @@ def run():
         st.subheader("5. Save to Cloud")
         title = st.text_input('Report title', value=f'{col2_name} vs {col1_name} Financial Report')
         
+        # Verify URL Box added here so you can confirm it is 100% correct before saving.
+        default_url = str(st.secrets.get('APP_URL', ''))
+        base_url_input = st.text_input('Verify your App URL (Must start with https://):', value=default_url)
+        
         if st.button('Save & Share Report', type='primary'):
             try:
-                base_url = str(st.secrets.get('APP_URL', ''))
-                if not base_url:
-                    st.error("Please add APP_URL in Streamlit secrets to generate valid shareable links.")
+                if not base_url_input or "https://" not in base_url_input:
+                    st.error("Please enter a valid APP_URL starting with https://")
                 else:
                     with st.spinner('Saving workbook and comments online...'):
                         share_token = save_report_snapshot(df, title, st.session_state.draft_comments, 
                                                            {'name': col1_name, 'start': str(col1_config['start']) if col1_config['start'] else None, 'end': str(col1_config['end']) if col1_config['end'] else None}, 
                                                            {'name': col2_name, 'start': str(col2_config['start']) if col2_config['start'] else None, 'end': str(col2_config['end']) if col2_config['end'] else None})
                     st.success('Report saved successfully!')
-                    st.code(report_link(base_url, share_token))
+                    st.code(report_link(base_url_input, share_token))
             except Exception as exc:
                 st.error(f'Save failed: {exc}')
 
