@@ -674,11 +674,11 @@ def run():
         default_url = str(st.secrets.get('APP_URL', ''))
         base_url_input = st.text_input('Verify your App URL (Must start with https://):', value=default_url)
         
-            if st.button('Save & Share Report', type='primary'):
+        if st.button('Save & Share Report', type='primary'):
             try:
                 if not base_url_input or "https://" not in base_url_input:
                     st.error("Please enter a valid APP_URL starting with https://")
-                else:
+            else:
                     with st.spinner('Saving workbook and comments online...'):
                         share_token = save_report_snapshot(
                             df, title, st.session_state.draft_comments, 
