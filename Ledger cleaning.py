@@ -91,7 +91,6 @@ def visible_rows(summary, expanded, col1_name, col2_name, formula_choice):
             count = part[CODE].nunique()
             label = f'{label} ({count} {"account" if count == 1 else "accounts"})'
         
-        # FIXED: Removed the python-side 'marker' (+/-) completely so JavaScript doesn't slice actual text!
         rows.append({'Hierarchy': label,
                      col2_name: new, col1_name: old, '% Change': change,
                      '_level': len(path), '_path': json.dumps(path, ensure_ascii=False, separators=(',', ':')),
@@ -289,8 +288,6 @@ def run():
             else:
                 df[sel_amt] = pd.to_numeric(df[sel_amt], errors='coerce').fillna(0)
             
-            df[sel_amt] = df[sel_amt] * -1
-            
             st.success(f"Matched {df[CODE].nunique()} unique accounts. Total transactions: {len(df)}")
             
             st.header("3. Calculation Settings")
@@ -371,8 +368,9 @@ def run():
     df_col1 = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
     df_col2 = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
     
-    col1_totals = df_col1.groupby(CODE)[sel_amt].sum()
-    col2_totals = df_col2.groupby(CODE)[sel_amt].sum()
+    # We multiply by -1 ONLY for the P&L summary totals, exactly as requested
+    col1_totals = df_col1.groupby(CODE)[sel_amt].sum() * -1
+    col2_totals = df_col2.groupby(CODE)[sel_amt].sum() * -1
     
     summary = df[[MAIN, SUB, CODE, 'Title']].drop_duplicates()
     summary[col1_name] = summary[CODE].map(col1_totals).fillna(0)
@@ -465,7 +463,6 @@ def run():
                     this.el.appendChild(button);
                 }
                 const text = document.createElement('span');
-                // FIXED BUG: Do not slice the text anymore. 
                 text.textContent = label;
                 this.el.appendChild(text);
             }
@@ -614,11 +611,11 @@ def run():
         
         a, b = st.columns(2)
         a.metric(f'Transactions · {period_label}', len(detail))
-        b.metric('Mapped Net Amount (After -1)', f'{detail[sel_amt].sum():,.2f}')
+        b.metric('Original Ledger Net Amount', f'{detail[sel_amt].sum():,.2f}')
         
-        original_amt = detail[sel_amt] * -1 
-        detail['Debit'] = original_amt.clip(lower=0)
-        detail['Credit'] = -original_amt.clip(upper=0)
+        # Keep unmodified original amounts as requested. Plus is Debit, Minus is Credit.
+        detail['Debit'] = detail[sel_amt].clip(lower=0)
+        detail['Credit'] = -detail[sel_amt].clip(upper=0)
         
         st.caption('Net = Debit − Credit.')
         
