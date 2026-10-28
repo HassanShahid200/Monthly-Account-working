@@ -399,7 +399,7 @@ def run():
             st.error(f"Could not load shared report: {e}")
             return
     else:
-        st.title('SAP Financial Ledger Dashboard')
+        st.title('P&L Comparison Report')
         # ========================================================
         # PASSWORD PROTECTION FOR EDITORS
         # ========================================================
