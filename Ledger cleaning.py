@@ -1,4 +1,5 @@
 from html import escape
+import gzip
 import hashlib
 import json
 import secrets
@@ -190,25 +191,30 @@ def pnl_statement_rows(summary, col1_name, col2_name):
     return rows
 
 
-def render_pnl_statement(summary, col1_config, col2_config):
+def render_pnl_statement(summary, col1_config, col2_config, formula_choice="(Col 1 - Col 2) / Col 2"):
     def heading(config):
         return escape(str(config.get('name') or ''))
+    def percent(first, second):
+        value = percentage_change(first, second, formula_choice)
+        return 'N/A' if value is None else f'{value:.2%}'
     body = []
     for label, first, second, style in pnl_statement_rows(
             summary, col1_config['name'], col2_config['name']):
         body.append(f'<tr class="{style}"><td>{escape(label)}</td>'
-                    f'<td>{accounting_amount(first)}</td><td>{accounting_amount(second)}</td></tr>')
+                    f'<td>{accounting_amount(first)}</td><td>{accounting_amount(second)}</td>'
+                    f'<td>{percent(first, second)}</td></tr>')
     body.append('<tr class="eps"><td>Earnings per share - basic and diluted</td>'
                 f'<td>{accounting_amount(col1_config.get("eps"), 2)}</td>'
-                f'<td>{accounting_amount(col2_config.get("eps"), 2)}</td></tr>')
+                f'<td>{accounting_amount(col2_config.get("eps"), 2)}</td>'
+                f'<td>{percent(col1_config["eps"], col2_config["eps"]) if col1_config.get("eps") is not None and col2_config.get("eps") is not None else "N/A"}</td></tr>')
     st.markdown('''
 <style>
 .pnl-wrap {overflow-x:auto; background:white; color:#111; padding:24px 16px;}
 .pnl {width:100%; border-collapse:separate; border-spacing:12px 0; font-family:Arial,sans-serif; font-size:14px;}
 .pnl th {text-align:center; padding:5px 8px 26px; vertical-align:top;}
 .pnl td {padding:5px 8px;}
-.pnl td:first-child {width:48%; text-align:left;}
-.pnl td:not(:first-child) {width:26%; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap;}
+.pnl td:first-child {width:43%; text-align:left;}
+.pnl td:not(:first-child) {width:19%; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap;}
 .pnl .currency th {padding:0 8px 32px; font-size:13px;}
 .pnl .subtotal td {font-weight:bold; padding-top:10px; padding-bottom:24px;}
 .pnl .subtotal td:not(:first-child) {border-top:1px solid #111;}
@@ -219,7 +225,7 @@ def render_pnl_statement(summary, col1_config, col2_config):
 </style>
 ''' + '<div class="pnl-wrap"><table class="pnl"><thead><tr><th></th><th>'
         + heading(col1_config) + '</th><th>' + heading(col2_config)
-        + '</th></tr><tr class="currency"><th></th><th colspan="2">(Rupees)</th></tr></thead><tbody>'
+        + '</th><th>% Change</th></tr><tr class="currency"><th></th><th colspan="2">(Rupees)</th><th></th></tr></thead><tbody>'
         + ''.join(body) + '</tbody></table></div>', unsafe_allow_html=True)
 
 
@@ -245,33 +251,73 @@ def fetch_shared_report(token):
     content = client.storage.from_(bucket).download(report['file_path'])
     return report, content
 
-def save_report_snapshot(df, title, comments, col1_config, col2_config, sel_date, sel_amt, formula_choice):
+@st.cache_data(max_entries=2, show_spinner=False)
+def serialize_snapshot(df):
+    # Excel cell-by-cell export is expensive for large ledgers. CSV + gzip
+    # retains all columns and full amount precision, with no new dependency.
+    return gzip.compress(df.to_csv(index=False).encode('utf-8'), compresslevel=1, mtime=0)
+
+
+def read_report_snapshot(content, filename):
+    if filename.lower().endswith('.csv.gz') or content[:2] == b'\x1f\x8b':
+        # Preserve text identifiers, including leading zeroes.
+        identifiers = {c: 'string' for c in
+                       (CODE, 'Account code', 'Doc No', 'Doc. No.', 'Origin',
+                        'Title', 'Acct Name', MAIN, SUB, 'Offset Acct')}
+        return pd.read_csv(BytesIO(content), compression='gzip', dtype=identifiers,
+                           float_precision='round_trip', low_memory=False)
+    # Existing cloud reports remain readable.
+    return pd.read_excel(BytesIO(content))
+
+
+def save_report_snapshot(df, title, comments, col1_config, col2_config, sel_date, sel_amt,
+                         formula_choice, progress=None):
+    def update(message):
+        if progress:
+            progress(message)
+    update('1/3 · Preparing and compressing ledger...')
+    content = serialize_snapshot(df)
     client = cloud_client()
     if not client:
         raise ValueError("Supabase credentials not found in secrets.")
-    
     bucket = str(st.secrets.get('SUPABASE_BUCKET', 'Ledger_Reports'))
     report_id = str(uuid.uuid4())
-    path = report_id + '/workbook.xlsx'
+    path = report_id + '/ledger.csv.gz'
     token = secrets.token_urlsafe(32)
-    
-    output = BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
-    
-    client.storage.from_(bucket).upload(path=path, file=output.getvalue())
-    
     payload = {
         'id': report_id, 'title': title.strip() or 'Financial Report',
-        'file_path': path, 'original_filename': 'mapped_ledger.xlsx',
-        'comments': dict(comments), 
+        'file_path': path, 'original_filename': 'mapped_ledger.csv.gz',
+        'comments': dict(comments),
         'reporting_period': json.dumps({
-            'col1': col1_config, 'col2': col2_config, 
+            'col1': col1_config, 'col2': col2_config,
             'sel_date': sel_date, 'sel_amt': sel_amt, 'formula': formula_choice
         }),
         'share_token_hash': token_digest(token)
     }
-    client.table('ledger_reports').insert(payload).execute()
+    update(f'2/3 · Uploading compressed ledger ({len(content) / 1024 / 1024:.2f} MB)...')
+    try:
+        client.storage.from_(bucket).upload(
+            path=path, file=content, file_options={'content-type': 'application/gzip'})
+    except Exception as exc:
+        raise RuntimeError(f'Ledger upload failed: {exc}') from exc
+    update('3/3 · Saving report settings and comments...')
+    try:
+        client.table('ledger_reports').insert(payload).execute()
+    except Exception as exc:
+        # A timeout may happen after the server committed the insert.
+        # Confirm absence before removing the file, so a saved report stays valid.
+        try:
+            records = client.table('ledger_reports').select('id').eq('id', report_id).limit(1).execute().data
+        except Exception:
+            raise RuntimeError('Could not confirm report save. Check Open Saved Report before retrying. '
+                               f'Details: {exc}') from exc
+        if not records:
+            try:
+                client.storage.from_(bucket).remove([path])
+            except Exception:
+                pass
+            raise RuntimeError(f'Report settings could not be saved: {exc}') from exc
+    update('Report saved successfully.')
     return token
 
 def fetch_recent_reports():
@@ -289,7 +335,7 @@ def load_saved_report(report_id):
 
 def report_link(base_url, token):
     parsed = urlsplit(base_url.strip())
-    if not parsed.netloc:
+    if parsed.scheme != 'https' or not parsed.netloc:
         raise ValueError("Invalid APP_URL. Make sure it starts with https://")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or '/', urlencode({'report': token}), ''))
 
@@ -333,7 +379,7 @@ def run():
             st.subheader(report_meta['title'])
             st.caption('Shared report - View only mode (Comments cannot be edited)')
             
-            df = pd.read_excel(BytesIO(content))
+            df = read_report_snapshot(content, report_meta.get('original_filename', 'workbook.xlsx'))
             
             st.session_state.draft_comments = report_meta.get('comments', {})
             configs = json.loads(report_meta['reporting_period'])
@@ -468,7 +514,7 @@ def run():
             if st.button("Load Selected Report", type="primary"):
                 with st.spinner("Downloading report from cloud..."):
                     report_meta, content = load_saved_report(selected_id)
-                    st.session_state.loaded_df = pd.read_excel(BytesIO(content))
+                    st.session_state.loaded_df = read_report_snapshot(content, report_meta.get('original_filename', 'workbook.xlsx'))
                     
                     st.session_state.draft_comments = report_meta.get('comments', {})
                     if report_meta.get('reporting_period'):
@@ -539,7 +585,7 @@ def run():
             st.caption('Enter the approved EPS for each period. Blank values display as a dash.')
     pnl_tab, level_tab = st.tabs(['P&L Format', 'Level-wise Report'])
     with pnl_tab:
-        render_pnl_statement(summary, col1_config, col2_config)
+        render_pnl_statement(summary, col1_config, col2_config, formula_choice)
         st.caption('Rupees rounded to whole Rupees. Negative amounts appear in parentheses. '
                    'Subtotals use underlying unrounded ledger values.')
     with level_tab:
@@ -825,20 +871,24 @@ def run():
         
         if st.button('Save & Share Report', type='primary'):
             try:
-                if not base_url_input or "https://" not in base_url_input:
+                if not base_url_input or urlsplit(base_url_input.strip()).scheme != "https" or not urlsplit(base_url_input.strip()).netloc:
                     st.error("Please enter a valid APP_URL starting with https://")
                 else:
-                    with st.spinner('Saving workbook and comments online...'):
+                    with st.status('Saving report...', expanded=True) as save_status:
                         share_token = save_report_snapshot(
                             df, title, st.session_state.draft_comments, 
                             {'name': col1_name, 'start': str(col1_config['start']) if col1_config['start'] else None, 'end': str(col1_config['end']) if col1_config['end'] else None, 'eps': col1_config.get('eps')}, 
                             {'name': col2_name, 'start': str(col2_config['start']) if col2_config['start'] else None, 'end': str(col2_config['end']) if col2_config['end'] else None, 'eps': col2_config.get('eps')},
-                            sel_date, sel_amt, formula_choice
+                            sel_date, sel_amt, formula_choice, progress=save_status.write
                         )
+                        save_status.update(label='Report saved successfully', state='complete', expanded=False)
+                    st.session_state.last_saved_report_link = report_link(base_url_input, share_token)
                     st.success('Report saved successfully!')
-                    st.code(report_link(base_url_input, share_token))
             except Exception as exc:
                 st.error(f'Save failed: {exc}')
+        if st.session_state.get('last_saved_report_link'):
+            st.caption('Last successfully saved report:')
+            st.code(st.session_state.last_saved_report_link)
 
 if __name__ == '__main__':
     run()
