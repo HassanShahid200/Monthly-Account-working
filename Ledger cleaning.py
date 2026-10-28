@@ -113,22 +113,33 @@ def filter_by_date(df, date_col, start_date, end_date):
         mask &= (df[date_col].dt.date <= pd.to_datetime(end_date).date())
     return df[mask]
 
+def percentage_change(col1, col2, formula_choice):
+    """Column 1 is latest/first; Column 2 is earlier/second for new reports.
+
+    Explicit older formulas remain supported for saved reports.
+    """
+    if formula_choice == "(Col 1 - Col 2) / Col 2":
+        return (col1 - col2) / col2 if col2 else None
+    if formula_choice == "(Col 1 - Col 2) / Col 1":
+        return (col1 - col2) / col1 if col1 else None
+    if formula_choice == "(Col 2 - Col 1) / Col 2":
+        return (col2 - col1) / col2 if col2 else None
+    return (col2 - col1) / col1 if col1 else None
+
+
 def visible_rows(summary, expanded, col1_name, col2_name, formula_choice):
     rows, paths = [], []
     def append_row(part, path, label):
         old, new = float(part[col1_name].sum()), float(part[col2_name].sum())
         
-        if formula_choice == "(Col 2 - Col 1) / Col 2":
-            change = (new - old) / new if new != 0 else None
-        else:
-            change = (new - old) / old if old != 0 else None
-            
+        change = percentage_change(old, new, formula_choice)
+
         if len(path) < 3:
             count = part[CODE].nunique()
             label = f'{label} ({count} {"account" if count == 1 else "accounts"})'
         
         rows.append({'Hierarchy': label,
-                     col2_name: new, col1_name: old, '% Change': change,
+                     col1_name: old, col2_name: new, '% Change': change,
                      '_level': len(path), '_path': json.dumps(path, ensure_ascii=False, separators=(',', ':')),
                      '_expanded': '', '_action': '', '_id': len(paths)})
         paths.append(path)
@@ -262,11 +273,11 @@ def run():
             st.session_state.draft_comments = report_meta.get('comments', {})
             configs = json.loads(report_meta['reporting_period'])
             
-            col1_config = configs.get('col1', {'name': '2025', 'start': None, 'end': None})
-            col2_config = configs.get('col2', {'name': '2026', 'start': None, 'end': None})
+            col1_config = configs.get('col1', {'name': '2026', 'start': None, 'end': None})
+            col2_config = configs.get('col2', {'name': '2025', 'start': None, 'end': None})
             sel_date = configs.get('sel_date', 'Posting Date')
             sel_amt = configs.get('sel_amt', 'Deb./Cred. (LC)')
-            formula_choice = configs.get('formula', '(Col 2 - Col 1) / Col 1')
+            formula_choice = configs.get('formula', '(Col 1 - Col 2) / Col 2')
             
             if sel_date in df.columns:
                 df = prepare_report_dates(df, sel_date)
@@ -301,11 +312,11 @@ def run():
         mode = st.radio("Choose Action", ["Create New Report (Upload Data)", "Open Saved Report (Cloud)"], horizontal=True)
         
         df = pd.DataFrame()
-        col1_config = {'name': '2025', 'start': None, 'end': None}
-        col2_config = {'name': '2026', 'start': None, 'end': None}
+        col1_config = {'name': '2026', 'start': None, 'end': None}
+        col2_config = {'name': '2025', 'start': None, 'end': None}
         sel_date = 'Posting Date'
         sel_amt = 'Deb./Cred. (LC)'
-        formula_choice = '(Col 2 - Col 1) / Col 1'
+        formula_choice = '(Col 1 - Col 2) / Col 2'
         
         if mode == "Create New Report (Upload Data)":
             st.header("1. Upload Data")
@@ -350,18 +361,20 @@ def run():
             st.header("3. Calculation Settings")
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.subheader("Column 1 Setup")
-                c1_name = st.text_input("Column 1 Name", value="2025")
+                st.subheader("Column 1 Setup — Latest Period (First)")
+                c1_name = st.text_input("Column 1 Name", value="2026")
                 c1_start = st.date_input("Start Date (Col 1)", value=None, key='c1s')
                 c1_end = st.date_input("End Date (Col 1)", value=None, key='c1e')
             with c2:
-                st.subheader("Column 2 Setup")
-                c2_name = st.text_input("Column 2 Name", value="2026")
+                st.subheader("Column 2 Setup — Earlier Period (Second)")
+                c2_name = st.text_input("Column 2 Name", value="2025")
                 c2_start = st.date_input("Start Date (Col 2)", value=None, key='c2s')
                 c2_end = st.date_input("End Date (Col 2)", value=None, key='c2e')
             with c3:
                 st.subheader("Formula Setup")
                 formula_choice = st.selectbox("Select % Change Formula", [
+                    "(Col 1 - Col 2) / Col 2",
+                    "(Col 1 - Col 2) / Col 1",
                     "(Col 2 - Col 1) / Col 1",
                     "(Col 2 - Col 1) / Col 2"
                 ])
@@ -371,7 +384,8 @@ def run():
 
             st.info(f"Selected Formula: **{formula_choice}**")
             st.caption("SAP dates use DD.MM.YY. For the screenshot comparison, select Posting Date, "
-                       "Deb./Cred. (LC), and (Col 2 - Col 1) / Col 1.")
+                       "Deb./Cred. (LC), Column 1 = 2026, Column 2 = 2025, "
+                       "and (Col 1 - Col 2) / Col 2.")
             if not st.button("Generate Report", type='primary') and not st.session_state.get('report_generated'):
                 return
             st.session_state.report_generated = True
@@ -399,7 +413,7 @@ def run():
                             st.session_state.loaded_col2_config = configs.get('col2')
                             st.session_state.loaded_sel_date = configs.get('sel_date', 'Posting Date')
                             st.session_state.loaded_sel_amt = configs.get('sel_amt', 'Deb./Cred. (LC)')
-                            st.session_state.loaded_formula = configs.get('formula', '(Col 2 - Col 1) / Col 1')
+                            st.session_state.loaded_formula = configs.get('formula', '(Col 1 - Col 2) / Col 2')
                         except:
                             pass
                             
@@ -553,17 +567,14 @@ def run():
                         
     total_new, total_old = float(summary[col2_name].sum()), float(summary[col1_name].sum())
     
-    if formula_choice == "(Col 2 - Col 1) / Col 2":
-        total_change = (total_new - total_old) / total_new if total_new else None
-    else:
-        total_change = (total_new - total_old) / total_old if total_old else None
+    total_change = percentage_change(total_old, total_new, formula_choice)
 
     gb.configure_grid_options(
         headerHeight=78,
         stopEditingWhenCellsLoseFocus=True,
         getRowId=JsCode("function(p) { return p.data._path; }"),
-        pinnedBottomRowData=[{'Hierarchy': 'Grand Total', col2_name: total_new,
-                              col1_name: total_old, '% Change': total_change}],
+        pinnedBottomRowData=[{'Hierarchy': 'Grand Total', col1_name: total_old,
+                              col2_name: total_new, '% Change': total_change}],
         context={'expanded': [json.dumps(path, ensure_ascii=False, separators=(',', ':'))
                               for path in sorted(st.session_state.expanded)]},
         isExternalFilterPresent=JsCode('function() { return true; }'),
@@ -646,7 +657,7 @@ def run():
                 if clicked_column in [col1_name, col2_name]:
                     st.session_state.ledger_col = clicked_column
                 else:
-                    st.session_state.ledger_col = col2_name
+                    st.session_state.ledger_col = col1_name
 
     # ========================================================
     # LEDGER DRILL DOWN SECTION
@@ -658,10 +669,10 @@ def run():
         
         st.write(f"**Selected scope:** {' → '.join(path)}")
         
-        if st.session_state.ledger_col not in [col2_name, col1_name]:
-            st.session_state.ledger_col = col2_name
+        if st.session_state.ledger_col not in [col1_name, col2_name]:
+            st.session_state.ledger_col = col1_name
             
-        selected_col = st.radio('Select the ledger period to view:', [col2_name, col1_name], horizontal=True, key='ledger_col')
+        selected_col = st.radio('Select the ledger period to view:', [col1_name, col2_name], horizontal=True, key='ledger_col')
         
         if selected_col == col1_name:
             detail = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
@@ -721,7 +732,7 @@ def run():
     if not read_only_mode:
         st.divider()
         st.subheader("5. Save to Cloud")
-        title = st.text_input('Report title', value=f'{col2_name} vs {col1_name} Financial Report')
+        title = st.text_input('Report title', value=f'{col1_name} vs {col2_name} Financial Report')
         
         default_url = str(st.secrets.get('APP_URL', ''))
         base_url_input = st.text_input('Verify your App URL (Must start with https://):', value=default_url)
