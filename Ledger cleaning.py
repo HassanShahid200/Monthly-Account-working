@@ -190,41 +190,84 @@ def pnl_statement_rows(summary, col1_name, col2_name):
     return rows
 
 
+def toggle_pnl_branch(path):
+    opened = st.session_state.expanded
+    if path in opened:
+        st.session_state.expanded = {p for p in opened if p[:len(path)] != path}
+    else:
+        st.session_state.expanded = opened | {path}
+
+
+def select_pnl_ledger(path, period):
+    st.session_state.ledger_path = path
+    st.session_state.ledger_col = period
+
+
 def render_pnl_statement(summary, col1_config, col2_config):
+    first, second = col1_config['name'], col2_config['name']
     def heading(config):
         name = escape(str(config['name']))
         if config.get('end'):
-            end = pd.Timestamp(config['end'])
-            return escape(end.strftime('%B %d,').upper()) + '<br>' + name
+            return escape(pd.Timestamp(config['end']).strftime('%B %d,').upper()) + '<br>' + name
         return name
-    body = []
-    for label, first, second, style in pnl_statement_rows(
-            summary, col1_config['name'], col2_config['name']):
-        body.append(f'<tr class="{style}"><td>{escape(label)}</td>'
-                    f'<td>{accounting_amount(first)}</td><td>{accounting_amount(second)}</td></tr>')
-    body.append('<tr class="eps"><td>Earnings per share - basic and diluted</td>'
-                f'<td>{accounting_amount(col1_config.get("eps"), 2)}</td>'
-                f'<td>{accounting_amount(col2_config.get("eps"), 2)}</td></tr>')
-    st.markdown('''
-<style>
-.pnl-wrap {overflow-x:auto; background:white; color:#111; padding:24px 16px;}
-.pnl {width:100%; border-collapse:separate; border-spacing:12px 0; font-family:Arial,sans-serif; font-size:14px;}
-.pnl th {text-align:center; padding:5px 8px 26px; vertical-align:top;}
-.pnl td {padding:5px 8px;}
-.pnl td:first-child {width:48%; text-align:left;}
-.pnl td:not(:first-child) {width:26%; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap;}
-.pnl .currency th {padding:0 8px 32px; font-size:13px;}
-.pnl .subtotal td {font-weight:bold; padding-top:10px; padding-bottom:24px;}
-.pnl .subtotal td:not(:first-child) {border-top:1px solid #111;}
-.pnl .final td {font-weight:bold; padding-top:10px; padding-bottom:5px;}
-.pnl .final td:not(:first-child) {border-top:1px solid #111; border-bottom:3px double #111;}
-.pnl .eps td {padding-top:28px; font-weight:bold;}
-.pnl .eps td:not(:first-child) {border-bottom:3px double #111;}
-</style>
-''' + '<div class="pnl-wrap"><table class="pnl"><thead><tr><th></th><th>'
-        + heading(col1_config) + '</th><th>' + heading(col2_config)
-        + '</th></tr><tr class="currency"><th></th><th colspan="2">(Rupees)</th></tr></thead><tbody>'
-        + ''.join(body) + '</tbody></table></div>', unsafe_allow_html=True)
+    st.markdown("""<style>
+.pnl-label {padding:9px 0; color:inherit;}
+.pnl-value {padding:9px 0; text-align:right; font-variant-numeric:tabular-nums;}
+.pnl-subtotal {font-weight:bold; border-top:1px solid currentColor; margin-top:12px; padding-top:8px;}
+.pnl-final {font-weight:bold; border-top:1px solid currentColor; border-bottom:3px double currentColor; padding:8px 0;}
+.pnl-heading {text-align:right; font-weight:bold;}
+</style>""", unsafe_allow_html=True)
+    c0, c1, c2 = st.columns([4, 2, 2])
+    c1.markdown('<div class="pnl-heading">' + heading(col1_config) + '</div>', unsafe_allow_html=True)
+    c2.markdown('<div class="pnl-heading">' + heading(col2_config) + '</div>', unsafe_allow_html=True)
+    st.caption('(Rupees) · Use + / − to expand or collapse. Click a name or amount to open its ledger.')
+    expand, collapse, _ = st.columns([1, 1, 4])
+    if expand.button('Expand all', key='pnl_expand_all'):
+        st.session_state.expanded = ({(m,) for m in summary[MAIN].unique()} |
+            {tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None)})
+    if collapse.button('Collapse all', key='pnl_collapse_all'):
+        st.session_state.expanded = set()
+
+    def detail_row(label, v1, v2, path):
+        key = json.dumps(path, ensure_ascii=False, separators=(',', ':'))
+        cells = st.columns([0.4, 3.6, 2, 2], vertical_alignment='center')
+        if len(path) < 3:
+            opened = path in st.session_state.expanded
+            cells[0].button('−' if opened else '+', key='pnl_toggle_' + key,
+                            on_click=toggle_pnl_branch, args=(path,))
+        indent = '　' * (len(path) - 1)
+        cells[1].button(indent + str(label), key='pnl_name_' + key,
+                        on_click=select_pnl_ledger, args=(path, first), use_container_width=True)
+        for cell, value, period, suffix in ((cells[2], v1, first, '1'), (cells[3], v2, second, '2')):
+            cell.button(accounting_amount(value), key='pnl_amount_' + suffix + key,
+                        on_click=select_pnl_ledger, args=(path, period), use_container_width=True)
+
+    for label, v1, v2, style in pnl_statement_rows(summary, first, second):
+        main = 'Finance Costs' if label == 'Finance costs' else label
+        if style != 'normal':
+            cells = st.columns([4, 2, 2])
+            cls = 'pnl-final' if style == 'final' else 'pnl-subtotal'
+            cells[0].markdown(f'<div class="pnl-label {cls}">{escape(label)}</div>', unsafe_allow_html=True)
+            for cell, value in ((cells[1], v1), (cells[2], v2)):
+                cell.markdown(f'<div class="pnl-value {cls}">{accounting_amount(value)}</div>', unsafe_allow_html=True)
+            continue
+        part = summary.loc[summary[MAIN].eq(main)]
+        path = (main,)
+        detail_row(label, v1, v2, path)
+        if path not in st.session_state.expanded:
+            continue
+        for sub, group in part.groupby(SUB, sort=True):
+            subpath = (main, sub)
+            detail_row(sub, float(group[first].sum()), float(group[second].sum()), subpath)
+            if subpath in st.session_state.expanded:
+                for _, account in group.sort_values(['Title', CODE]).iterrows():
+                    detail_row(f"{account['Title']} [{account[CODE]}]", account[first], account[second],
+                               (main, sub, account[CODE]))
+    cells = st.columns([4, 2, 2])
+    cells[0].markdown('**Earnings per share - basic and diluted**')
+    for cell, config in ((cells[1], col1_config), (cells[2], col2_config)):
+        cell.markdown('<div class="pnl-value pnl-final">' + accounting_amount(config.get('eps'), 2) + '</div>',
+                      unsafe_allow_html=True)
 
 
 def cloud_client():
@@ -741,71 +784,74 @@ def run():
                     else:
                         st.session_state.ledger_col = col1_name
 
-        # ========================================================
-        # LEDGER DRILL DOWN SECTION
-        # ========================================================
-        path = st.session_state.ledger_path
-        if path is not None:
-            st.divider()
-            st.subheader('Ledger Details')
+    # ========================================================
+    # LEDGER DRILL DOWN SECTION
+    # ========================================================
+    path = st.session_state.ledger_path
+    if path is not None:
+        st.divider()
+        st.subheader('Ledger Details')
+        if st.button('Close ledger details', key='close_pnl_ledger'):
+            st.session_state.ledger_path = None
+            st.rerun()
+    
+        st.write(f"**Selected scope:** {' → '.join(path)}")
+    
+        if st.session_state.ledger_col not in [col1_name, col2_name]:
+            st.session_state.ledger_col = col1_name
         
-            st.write(f"**Selected scope:** {' → '.join(path)}")
+        selected_col = st.radio('Select the ledger period to view:', [col1_name, col2_name], horizontal=True, key='ledger_col')
+    
+        if selected_col == col1_name:
+            detail = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
+            period_label = col1_name
+        else:
+            detail = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
+            period_label = col2_name
+    
+        mask = detail[MAIN].eq(path[0])
+        if len(path) >= 2: mask &= detail[SUB].eq(path[1])
+        if len(path) == 3: mask &= detail[CODE].eq(path[2])
+    
+        detail = detail.loc[mask].copy()
+    
+        if sel_date in detail.columns:
+            detail = detail.sort_values(sel_date)
+    
+        a, b = st.columns(2)
+        a.metric(f'Transactions · {period_label}', len(detail))
+        b.metric('Original Ledger Net Amount', f'{detail[sel_amt].sum():,.2f}')
+    
+        # Keep unmodified original amounts as requested. Plus is Debit, Minus is Credit.
+        detail['Debit'] = detail[sel_amt].clip(lower=0)
+        detail['Credit'] = -detail[sel_amt].clip(upper=0)
+    
+        st.caption('Net = Debit − Credit.')
+    
+        columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', sel_date, 'Origin', 'Doc No',
+                   'Remarks', 'Offset Acct', 'Offset Acct Name', 'Debit', 'Credit', sel_amt]
+        detail = detail[[col for col in columns if col in detail.columns]].copy()
+    
+        if sel_date in detail.columns:
+            detail[sel_date] = detail[sel_date].dt.strftime('%Y-%m-%d')
         
-            if st.session_state.ledger_col not in [col1_name, col2_name]:
-                st.session_state.ledger_col = col1_name
+        if detail.empty:
+            st.info('No transactions were found for this selection and period.')
+        else:
+            total_row = {col: '' for col in detail.columns}
+            total_row[CODE] = 'Grand Total'
+            for col in ['Debit', 'Credit', sel_amt]:
+                total_row[col] = float(detail[col].sum())
             
-            selected_col = st.radio('Select the ledger period to view:', [col1_name, col2_name], horizontal=True, key='ledger_col')
+            detail = pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
+            st.dataframe(detail, use_container_width=True, hide_index=True,
+                         column_config={col: st.column_config.NumberColumn(format='%.2f')
+                                        for col in ['Debit', 'Credit', sel_amt]})
         
-            if selected_col == col1_name:
-                detail = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
-                period_label = col1_name
-            else:
-                detail = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
-                period_label = col2_name
-        
-            mask = detail[MAIN].eq(path[0])
-            if len(path) >= 2: mask &= detail[SUB].eq(path[1])
-            if len(path) == 3: mask &= detail[CODE].eq(path[2])
-        
-            detail = detail.loc[mask].copy()
-        
-            if sel_date in detail.columns:
-                detail = detail.sort_values(sel_date)
-        
-            a, b = st.columns(2)
-            a.metric(f'Transactions · {period_label}', len(detail))
-            b.metric('Original Ledger Net Amount', f'{detail[sel_amt].sum():,.2f}')
-        
-            # Keep unmodified original amounts as requested. Plus is Debit, Minus is Credit.
-            detail['Debit'] = detail[sel_amt].clip(lower=0)
-            detail['Credit'] = -detail[sel_amt].clip(upper=0)
-        
-            st.caption('Net = Debit − Credit.')
-        
-            columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', sel_date, 'Origin', 'Doc No',
-                       'Remarks', 'Offset Acct', 'Offset Acct Name', 'Debit', 'Credit', sel_amt]
-            detail = detail[[col for col in columns if col in detail.columns]].copy()
-        
-            if sel_date in detail.columns:
-                detail[sel_date] = detail[sel_date].dt.strftime('%Y-%m-%d')
-            
-            if detail.empty:
-                st.info('No transactions were found for this selection and period.')
-            else:
-                total_row = {col: '' for col in detail.columns}
-                total_row[CODE] = 'Grand Total'
-                for col in ['Debit', 'Credit', sel_amt]:
-                    total_row[col] = float(detail[col].sum())
-                
-                detail = pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
-                st.dataframe(detail, use_container_width=True, hide_index=True,
-                             column_config={col: st.column_config.NumberColumn(format='%.2f')
-                                            for col in ['Debit', 'Credit', sel_amt]})
-            
-                st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
-                                   file_name=f'ledger_{period_label}.csv', mime='text/csv')
+            st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
+                               file_name=f'ledger_{period_label}.csv', mime='text/csv')
 
-        # ========================================================
+    # ========================================================
     # SAVE TO CLOUD (ONLY FOR EDITORS)
     # ========================================================
        # ========================================================
