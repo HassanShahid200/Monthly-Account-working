@@ -1,3 +1,4 @@
+from html import escape
 import hashlib
 import json
 import secrets
@@ -157,6 +158,74 @@ def visible_rows(summary, expanded, col1_name, col2_name, formula_choice):
                     append_row(account.to_frame().T, (main, sub, account[CODE]),
                                f"{account['Title']} [{account[CODE]}]")
     return pd.DataFrame(rows), paths
+
+def accounting_amount(value, decimals=0):
+    if value is None or pd.isna(value):
+        return '—'
+    value = round(float(value), decimals)
+    number = f"{abs(value):,.{decimals}f}"
+    return f"({number})" if value < 0 else number
+
+
+def pnl_statement_rows(summary, col1_name, col2_name):
+    totals = summary.groupby(MAIN)[[col1_name, col2_name]].sum()
+    def values(names):
+        return tuple(float(totals.reindex(names).fillna(0)[c].sum())
+                     for c in (col1_name, col2_name))
+    rows = []
+    def add(label, names, style='normal'):
+        rows.append((label, *values(names), style))
+    add('Sales - net', [ORDER[0]])
+    add('Cost of sales', [ORDER[1]])
+    add('Gross profit', ORDER[:2], 'subtotal')
+    for main in ORDER[2:7]:
+        add('Finance costs' if main == 'Finance Costs' else main, [main])
+    # Keep additional mapped classes visible and included in the reconciliation.
+    extra = [name for name in totals.index if name not in ORDER]
+    for main in extra:
+        add(str(main), [main])
+    add('Profit before taxation', ORDER[:7] + extra, 'subtotal')
+    add('Taxation', ['Taxation'])
+    add('Profit/(Loss) for the period', ORDER + extra, 'final')
+    return rows
+
+
+def render_pnl_statement(summary, col1_config, col2_config):
+    def heading(config):
+        name = escape(str(config['name']))
+        if config.get('end'):
+            end = pd.Timestamp(config['end'])
+            return escape(end.strftime('%B %d,').upper()) + '<br>' + name
+        return name
+    body = []
+    for label, first, second, style in pnl_statement_rows(
+            summary, col1_config['name'], col2_config['name']):
+        body.append(f'<tr class="{style}"><td>{escape(label)}</td>'
+                    f'<td>{accounting_amount(first)}</td><td>{accounting_amount(second)}</td></tr>')
+    body.append('<tr class="eps"><td>Earnings per share - basic and diluted</td>'
+                f'<td>{accounting_amount(col1_config.get("eps"), 2)}</td>'
+                f'<td>{accounting_amount(col2_config.get("eps"), 2)}</td></tr>')
+    st.markdown('''
+<style>
+.pnl-wrap {overflow-x:auto; background:white; color:#111; padding:24px 16px;}
+.pnl {width:100%; border-collapse:separate; border-spacing:12px 0; font-family:Arial,sans-serif; font-size:14px;}
+.pnl th {text-align:center; padding:5px 8px 26px; vertical-align:top;}
+.pnl td {padding:5px 8px;}
+.pnl td:first-child {width:48%; text-align:left;}
+.pnl td:not(:first-child) {width:26%; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap;}
+.pnl .currency th {padding:0 8px 32px; font-size:13px;}
+.pnl .subtotal td {font-weight:bold; padding-top:10px; padding-bottom:24px;}
+.pnl .subtotal td:not(:first-child) {border-top:1px solid #111;}
+.pnl .final td {font-weight:bold; padding-top:10px; padding-bottom:5px;}
+.pnl .final td:not(:first-child) {border-top:1px solid #111; border-bottom:3px double #111;}
+.pnl .eps td {padding-top:28px; font-weight:bold;}
+.pnl .eps td:not(:first-child) {border-bottom:3px double #111;}
+</style>
+''' + '<div class="pnl-wrap"><table class="pnl"><thead><tr><th></th><th>'
+        + heading(col1_config) + '</th><th>' + heading(col2_config)
+        + '</th></tr><tr class="currency"><th></th><th colspan="2">(Rupees)</th></tr></thead><tbody>'
+        + ''.join(body) + '</tbody></table></div>', unsafe_allow_html=True)
+
 
 def cloud_client():
     from supabase import create_client
@@ -464,266 +533,279 @@ def run():
     if not read_only_mode:
         st.subheader('3. Profit and Loss Summary')
     
-    all_branches = {(m,) for m in summary[MAIN].unique()}
-    all_branches.update(tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
-    table, paths = visible_rows(summary, all_branches, col1_name, col2_name, formula_choice)
-    
-    comments = st.session_state.draft_comments
-    table['Comments'] = table['_path'].map(comments).fillna('')
-    
-    gb = GridOptionsBuilder.from_dataframe(table)
-    gb.configure_default_column(sortable=False, filter=False, resizable=True, editable=False)
-    for col in ['_id', '_level', '_action', '_path', '_expanded']:
-        gb.configure_column(col, hide=True)
-        
-    gb.configure_column('Hierarchy', header_name='Main Class / Sub Class / Account', minWidth=450,
-                        cellStyle={'whiteSpace': 'pre'},
-                        headerComponent=JsCode('''class LevelHeader {
-            init(p) {
-                this.el = document.createElement('div');
-                this.el.style.cssText = 'width:100%;display:flex;flex-direction:column;gap:8px;';
-                const title = document.createElement('span');
-                title.textContent = p.displayName;
-                this.el.appendChild(title);
-                const controls = document.createElement('div');
-                controls.style.cssText = 'display:flex;gap:6px;';
-                ['Level 1', 'Level 2', 'Level 3'].forEach((label, index) => {
-                    const button = document.createElement('button');
-                    button.type = 'button';
-                    button.textContent = label;
-                    button.style.cssText = 'cursor:pointer;padding:4px 12px;border:1px solid #a7bbce;border-radius:5px;background:#ffffff;color:#17324d;font-size:13px;font-weight:bold;';
-                    button.addEventListener('click', (event) => {
-                        event.stopPropagation();
-                        const opened = [];
-                        p.api.forEachNode(node => {
-                            if (node.data && node.data._level <= index) opened.push(node.data._path);
-                        });
-                        window.__ledgerExpanded = opened;
-                        p.api.onFilterChanged();
-                        p.api.refreshCells({columns: ['Hierarchy'], force: true});
-                    });
-                    controls.appendChild(button);
-                });
-                this.el.appendChild(controls);
-            }
-            getGui() { return this.el; }
-        }'''),
-                        cellRenderer=JsCode('''class HierarchyRenderer {
-            init(p) {
-                this.el = document.createElement('div');
-                if (p.node.rowPinned) {
-                    this.el.textContent = p.value;
-                    return;
-                }
-                this.el.style.display = 'flex';
-                this.el.style.alignItems = 'center';
-                this.el.style.paddingLeft = ((p.data._level - 1) * 22) + 'px';
-                const label = String(p.value || '').trim();
-                if (p.data._level < 3) {
-                    const button = document.createElement('button');
-                    button.type = 'button';
-                    const isOpen = (window.__ledgerExpanded || []).includes(p.data._path);
-                    button.textContent = isOpen ? '−' : '+';
-                    
-                    const btnColor = p.data._level === 1 ? '#ffffff' : '#17324d';
-                    button.style.cssText = 'cursor:pointer;width:24px;height:24px;margin-right:9px;border:1.5px solid ' + btnColor + ';border-radius:4px;background:transparent;color:' + btnColor + ';font-weight:bold;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;';
-                    
-                    button.addEventListener('click', function(e) {
-                        e.stopPropagation();
-                        const key = p.data._path;
-                        const opened = window.__ledgerExpanded || [];
-                        if (opened.includes(key)) {
-                            const prefix = JSON.parse(key);
-                            window.__ledgerExpanded = opened.filter(function(item) {
-                                const path = JSON.parse(item);
-                                return !prefix.every((value, i) => path[i] === value);
-                            });
-                        } else {
-                            window.__ledgerExpanded = opened.concat([key]);
-                        }
-                        p.api.onFilterChanged();
-                        p.api.refreshCells({columns: ['Hierarchy'], force: true});
-                    });
-                    this.el.appendChild(button);
-                }
-                const text = document.createElement('span');
-                text.textContent = label;
-                this.el.appendChild(text);
-            }
-            getGui() { return this.el; }
-        }'''))
-        
-    money = JsCode("function(p) { return p.value == null ? '' : Number(p.value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }")
-    percent = JsCode("function(p) { return p.value == null ? 'N/A' : Number(p.value).toLocaleString('en-US', {style:'percent', minimumFractionDigits:2, maximumFractionDigits:2}); }")
-    
-    gb.configure_column(col2_name, type=['numericColumn'], minWidth=150, valueFormatter=money)
-    gb.configure_column(col1_name, type=['numericColumn'], minWidth=150, valueFormatter=money)
-    gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
-    
-    gb.configure_column('Comments', minWidth=280, width=360, wrapText=True, autoHeight=True,
-                        editable=JsCode('function(p) { return !p.node.rowPinned; }') if not read_only_mode else False,
-                        cellEditor='agLargeTextCellEditor', cellEditorPopup=True,
-                        cellEditorParams={'maxLength': 4000, 'rows': 5, 'cols': 45})
-                        
-    total_new, total_old = float(summary[col2_name].sum()), float(summary[col1_name].sum())
-    
-    total_change = percentage_change(total_old, total_new, formula_choice)
+    if not read_only_mode:
+        with st.expander('Earnings per share (optional)'):
+            eps1, eps2 = st.columns(2)
+            col1_config['eps'] = eps1.number_input(
+                f"EPS · {col1_name}", value=col1_config.get('eps'), step=0.01, format='%.2f')
+            col2_config['eps'] = eps2.number_input(
+                f"EPS · {col2_name}", value=col2_config.get('eps'), step=0.01, format='%.2f')
+            st.caption('Enter the approved EPS for each period. Blank values display as a dash.')
+    render_pnl_statement(summary, col1_config, col2_config)
+    st.caption('Amounts in Rupees, rounded to whole Rupees. Negative amounts appear in parentheses. '
+               'Subtotals use the underlying unrounded ledger values.')
 
-    gb.configure_grid_options(
-        headerHeight=78,
-        stopEditingWhenCellsLoseFocus=True,
-        getRowId=JsCode("function(p) { return p.data._path; }"),
-        pinnedBottomRowData=[{'Hierarchy': 'Grand Total', col1_name: total_old,
-                              col2_name: total_new, '% Change': total_change}],
-        context={'expanded': [json.dumps(path, ensure_ascii=False, separators=(',', ':'))
-                              for path in sorted(st.session_state.expanded)]},
-        isExternalFilterPresent=JsCode('function() { return true; }'),
-        doesExternalFilterPass=JsCode('''function(p) {
-            const path = JSON.parse(p.data._path);
-            for (let depth = 1; depth < path.length; depth++) {
-                if (!(window.__ledgerExpanded || []).includes(JSON.stringify(path.slice(0, depth)))) return false;
-            }
-            return true;
-        }'''),
-        onGridReady=JsCode('function(p) { window.__ledgerExpanded = ((p.context && p.context.expanded) || []).slice(); p.api.onFilterChanged(); }'),
-        onFirstDataRendered=JsCode('function(p) { p.api.onFilterChanged(); }'),
-        onCellClicked=JsCode('''function(p) {
-            if (!p.data || p.node.rowPinned || ['_action', 'Comments', '% Change'].includes(p.colDef.field)) return;
-            p.api.forEachNode(function(node) { node.data._action = ''; });
-            p.data._expanded = JSON.stringify(window.__ledgerExpanded || []);
-            p.data._action = 'ledger:' + p.colDef.field + ':' + Date.now();
-        }'''),
-        onCellValueChanged=JsCode('''function(p) {
-            if (p.colDef.field === 'Comments') {
+    with st.expander('Account details, percentage changes and comments', expanded=False):
+        all_branches = {(m,) for m in summary[MAIN].unique()}
+        all_branches.update(tuple(r) for r in summary[[MAIN, SUB]].drop_duplicates().itertuples(index=False, name=None))
+        table, paths = visible_rows(summary, all_branches, col1_name, col2_name, formula_choice)
+    
+        comments = st.session_state.draft_comments
+        table['Comments'] = table['_path'].map(comments).fillna('')
+    
+        gb = GridOptionsBuilder.from_dataframe(table)
+        gb.configure_default_column(sortable=False, filter=False, resizable=True, editable=False)
+        for col in ['_id', '_level', '_action', '_path', '_expanded']:
+            gb.configure_column(col, hide=True)
+        
+        gb.configure_column('Hierarchy', header_name='Main Class / Sub Class / Account', minWidth=450,
+                            cellStyle={'whiteSpace': 'pre'},
+                            headerComponent=JsCode('''class LevelHeader {
+                init(p) {
+                    this.el = document.createElement('div');
+                    this.el.style.cssText = 'width:100%;display:flex;flex-direction:column;gap:8px;';
+                    const title = document.createElement('span');
+                    title.textContent = p.displayName;
+                    this.el.appendChild(title);
+                    const controls = document.createElement('div');
+                    controls.style.cssText = 'display:flex;gap:6px;';
+                    ['Level 1', 'Level 2', 'Level 3'].forEach((label, index) => {
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        button.textContent = label;
+                        button.style.cssText = 'cursor:pointer;padding:4px 12px;border:1px solid #a7bbce;border-radius:5px;background:#ffffff;color:#17324d;font-size:13px;font-weight:bold;';
+                        button.addEventListener('click', (event) => {
+                            event.stopPropagation();
+                            const opened = [];
+                            p.api.forEachNode(node => {
+                                if (node.data && node.data._level <= index) opened.push(node.data._path);
+                            });
+                            window.__ledgerExpanded = opened;
+                            p.api.onFilterChanged();
+                            p.api.refreshCells({columns: ['Hierarchy'], force: true});
+                        });
+                        controls.appendChild(button);
+                    });
+                    this.el.appendChild(controls);
+                }
+                getGui() { return this.el; }
+            }'''),
+                            cellRenderer=JsCode('''class HierarchyRenderer {
+                init(p) {
+                    this.el = document.createElement('div');
+                    if (p.node.rowPinned) {
+                        this.el.textContent = p.value;
+                        return;
+                    }
+                    this.el.style.display = 'flex';
+                    this.el.style.alignItems = 'center';
+                    this.el.style.paddingLeft = ((p.data._level - 1) * 22) + 'px';
+                    const label = String(p.value || '').trim();
+                    if (p.data._level < 3) {
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        const isOpen = (window.__ledgerExpanded || []).includes(p.data._path);
+                        button.textContent = isOpen ? '−' : '+';
+                    
+                        const btnColor = p.data._level === 1 ? '#ffffff' : '#17324d';
+                        button.style.cssText = 'cursor:pointer;width:24px;height:24px;margin-right:9px;border:1.5px solid ' + btnColor + ';border-radius:4px;background:transparent;color:' + btnColor + ';font-weight:bold;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;';
+                    
+                        button.addEventListener('click', function(e) {
+                            e.stopPropagation();
+                            const key = p.data._path;
+                            const opened = window.__ledgerExpanded || [];
+                            if (opened.includes(key)) {
+                                const prefix = JSON.parse(key);
+                                window.__ledgerExpanded = opened.filter(function(item) {
+                                    const path = JSON.parse(item);
+                                    return !prefix.every((value, i) => path[i] === value);
+                                });
+                            } else {
+                                window.__ledgerExpanded = opened.concat([key]);
+                            }
+                            p.api.onFilterChanged();
+                            p.api.refreshCells({columns: ['Hierarchy'], force: true});
+                        });
+                        this.el.appendChild(button);
+                    }
+                    const text = document.createElement('span');
+                    text.textContent = label;
+                    this.el.appendChild(text);
+                }
+                getGui() { return this.el; }
+            }'''))
+        
+        money = JsCode("function(p) { if (p.value == null) return ''; const v = Number(p.value); const n = Math.abs(v).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); return v < 0 ? '(' + n + ')' : n; }")
+        percent = JsCode("function(p) { return p.value == null ? 'N/A' : Number(p.value).toLocaleString('en-US', {style:'percent', minimumFractionDigits:2, maximumFractionDigits:2}); }")
+    
+        gb.configure_column(col2_name, type=['numericColumn'], minWidth=150, valueFormatter=money)
+        gb.configure_column(col1_name, type=['numericColumn'], minWidth=150, valueFormatter=money)
+        gb.configure_column('% Change', type=['numericColumn'], valueFormatter=percent)
+    
+        gb.configure_column('Comments', minWidth=280, width=360, wrapText=True, autoHeight=True,
+                            editable=JsCode('function(p) { return !p.node.rowPinned; }') if not read_only_mode else False,
+                            cellEditor='agLargeTextCellEditor', cellEditorPopup=True,
+                            cellEditorParams={'maxLength': 4000, 'rows': 5, 'cols': 45})
+                        
+        total_new, total_old = float(summary[col2_name].sum()), float(summary[col1_name].sum())
+    
+        total_change = percentage_change(total_old, total_new, formula_choice)
+
+        gb.configure_grid_options(
+            headerHeight=78,
+            stopEditingWhenCellsLoseFocus=True,
+            getRowId=JsCode("function(p) { return p.data._path; }"),
+            pinnedBottomRowData=[{'Hierarchy': 'Grand Total', col1_name: total_old,
+                                  col2_name: total_new, '% Change': total_change}],
+            context={'expanded': [json.dumps(path, ensure_ascii=False, separators=(',', ':'))
+                                  for path in sorted(st.session_state.expanded)]},
+            isExternalFilterPresent=JsCode('function() { return true; }'),
+            doesExternalFilterPass=JsCode('''function(p) {
+                const path = JSON.parse(p.data._path);
+                for (let depth = 1; depth < path.length; depth++) {
+                    if (!(window.__ledgerExpanded || []).includes(JSON.stringify(path.slice(0, depth)))) return false;
+                }
+                return true;
+            }'''),
+            onGridReady=JsCode('function(p) { window.__ledgerExpanded = ((p.context && p.context.expanded) || []).slice(); p.api.onFilterChanged(); }'),
+            onFirstDataRendered=JsCode('function(p) { p.api.onFilterChanged(); }'),
+            onCellClicked=JsCode('''function(p) {
+                if (!p.data || p.node.rowPinned || ['_action', 'Comments', '% Change'].includes(p.colDef.field)) return;
                 p.api.forEachNode(function(node) { node.data._action = ''; });
                 p.data._expanded = JSON.stringify(window.__ledgerExpanded || []);
-            }
-        }'''),
-        getRowStyle=JsCode('''function(p) {
-            if (!p.data) return {};
-            if (p.node.rowPinned) return { backgroundColor: '#17324d', color: '#ffffff', fontWeight: '700', borderTop: '2px solid #a7bbce'};
-            if (p.data._level === 1) return { backgroundColor: '#17324d', color: '#ffffff', fontWeight: '700', borderTop: '2px solid #ffffff'};
-            if (p.data._level === 2) return { backgroundColor: '#e7eff7', color: '#17324d', fontWeight: '600', borderBottom: '1px solid #cedcea'};
-            return { backgroundColor: '#ffffff', color: '#374151', borderBottom: '1px solid #eef2f6'};
-        }''')
-    )
+                p.data._action = 'ledger:' + p.colDef.field + ':' + Date.now();
+            }'''),
+            onCellValueChanged=JsCode('''function(p) {
+                if (p.colDef.field === 'Comments') {
+                    p.api.forEachNode(function(node) { node.data._action = ''; });
+                    p.data._expanded = JSON.stringify(window.__ledgerExpanded || []);
+                }
+            }'''),
+            getRowStyle=JsCode('''function(p) {
+                if (!p.data) return {};
+                if (p.node.rowPinned) return { backgroundColor: '#17324d', color: '#ffffff', fontWeight: '700', borderTop: '2px solid #a7bbce'};
+                if (p.data._level === 1) return { backgroundColor: '#17324d', color: '#ffffff', fontWeight: '700', borderTop: '2px solid #ffffff'};
+                if (p.data._level === 2) return { backgroundColor: '#e7eff7', color: '#17324d', fontWeight: '600', borderBottom: '1px solid #cedcea'};
+                return { backgroundColor: '#ffffff', color: '#374151', borderBottom: '1px solid #eef2f6'};
+            }''')
+        )
 
-    st.caption('Click a name or amount to open its ledger below.')
-    response = AgGrid(table, gridOptions=gb.build(), height=500, theme='streamlit',
-                      allow_unsafe_jscode=True, update_on=['cellClicked', 'cellValueChanged'],
-                      data_return_mode=DataReturnMode.AS_INPUT,
-                      should_grid_return=JsCode('''function(p) {
-                          const event = p.eventData;
-                          if (!event || !event.data || (event.node && event.node.rowPinned)) return false;
-                          const field = event.colDef && event.colDef.field;
-                          if (p.streamlitRerunEventTriggerName === 'cellClicked') {
-                              return ['Hierarchy', "''' + col2_name + '''", "''' + col1_name + '''"].includes(field);
-                          }
-                          return p.streamlitRerunEventTriggerName === 'cellValueChanged' && field === 'Comments';
-                      }'''))
+        st.caption('Click a name or amount to open its ledger below.')
+        response = AgGrid(table, gridOptions=gb.build(), height=500, theme='streamlit',
+                          allow_unsafe_jscode=True, update_on=['cellClicked', 'cellValueChanged'],
+                          data_return_mode=DataReturnMode.AS_INPUT,
+                          should_grid_return=JsCode('''function(p) {
+                              const event = p.eventData;
+                              if (!event || !event.data || (event.node && event.node.rowPinned)) return false;
+                              const field = event.colDef && event.colDef.field;
+                              if (p.streamlitRerunEventTriggerName === 'cellClicked') {
+                                  return ['Hierarchy', "''' + col2_name + '''", "''' + col1_name + '''"].includes(field);
+                              }
+                              return p.streamlitRerunEventTriggerName === 'cellValueChanged' && field === 'Comments';
+                          }'''))
 
-    returned = response.data
+        returned = response.data
     
-    if not read_only_mode:
-        if isinstance(returned, pd.DataFrame) and {'_path', 'Comments'}.issubset(returned.columns):
-            valid = set(table['_path'])
-            for _, row in returned.iterrows():
-                path = row['_path']
-                if path in valid:
-                    val = row['Comments']
-                    text = '' if pd.isna(val) else str(val)[:4000]
-                    if text:
-                        st.session_state.draft_comments[path] = text
+        if not read_only_mode:
+            if isinstance(returned, pd.DataFrame) and {'_path', 'Comments'}.issubset(returned.columns):
+                valid = set(table['_path'])
+                for _, row in returned.iterrows():
+                    path = row['_path']
+                    if path in valid:
+                        val = row['Comments']
+                        text = '' if pd.isna(val) else str(val)[:4000]
+                        if text:
+                            st.session_state.draft_comments[path] = text
+                        else:
+                            st.session_state.draft_comments.pop(path, None)
+
+        # Handle Action / Drill-down
+        if isinstance(returned, pd.DataFrame) and '_action' in returned.columns:
+            actions = returned.loc[returned['_action'].fillna('').ne('')]
+            if not actions.empty:
+                action_row = actions.iloc[-1]
+                action_path = paths[int(action_row['_id'])]
+                action = str(action_row['_action'])
+            
+                token = (action_row['_id'], action)
+                if st.session_state.get('handled_action') != token:
+                    st.session_state.handled_action = token
+                    st.session_state.ledger_path = action_path
+                    opened = action_row.get('_expanded', '')
+                    if opened:
+                        st.session_state.expanded = {tuple(json.loads(item)) for item in json.loads(opened)}
+                
+                    clicked_column = action.split(':')[1]
+                    if clicked_column in [col1_name, col2_name]:
+                        st.session_state.ledger_col = clicked_column
                     else:
-                        st.session_state.draft_comments.pop(path, None)
+                        st.session_state.ledger_col = col1_name
 
-    # Handle Action / Drill-down
-    if isinstance(returned, pd.DataFrame) and '_action' in returned.columns:
-        actions = returned.loc[returned['_action'].fillna('').ne('')]
-        if not actions.empty:
-            action_row = actions.iloc[-1]
-            action_path = paths[int(action_row['_id'])]
-            action = str(action_row['_action'])
+        # ========================================================
+        # LEDGER DRILL DOWN SECTION
+        # ========================================================
+        path = st.session_state.ledger_path
+        if path is not None:
+            st.divider()
+            st.subheader('Ledger Details')
+        
+            st.write(f"**Selected scope:** {' → '.join(path)}")
+        
+            if st.session_state.ledger_col not in [col1_name, col2_name]:
+                st.session_state.ledger_col = col1_name
             
-            token = (action_row['_id'], action)
-            if st.session_state.get('handled_action') != token:
-                st.session_state.handled_action = token
-                st.session_state.ledger_path = action_path
-                opened = action_row.get('_expanded', '')
-                if opened:
-                    st.session_state.expanded = {tuple(json.loads(item)) for item in json.loads(opened)}
+            selected_col = st.radio('Select the ledger period to view:', [col1_name, col2_name], horizontal=True, key='ledger_col')
+        
+            if selected_col == col1_name:
+                detail = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
+                period_label = col1_name
+            else:
+                detail = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
+                period_label = col2_name
+        
+            mask = detail[MAIN].eq(path[0])
+            if len(path) >= 2: mask &= detail[SUB].eq(path[1])
+            if len(path) == 3: mask &= detail[CODE].eq(path[2])
+        
+            detail = detail.loc[mask].copy()
+        
+            if sel_date in detail.columns:
+                detail = detail.sort_values(sel_date)
+        
+            a, b = st.columns(2)
+            a.metric(f'Transactions · {period_label}', len(detail))
+            b.metric('Original Ledger Net Amount', f'{detail[sel_amt].sum():,.2f}')
+        
+            # Keep unmodified original amounts as requested. Plus is Debit, Minus is Credit.
+            detail['Debit'] = detail[sel_amt].clip(lower=0)
+            detail['Credit'] = -detail[sel_amt].clip(upper=0)
+        
+            st.caption('Net = Debit − Credit.')
+        
+            columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', sel_date, 'Origin', 'Doc No',
+                       'Remarks', 'Offset Acct', 'Offset Acct Name', 'Debit', 'Credit', sel_amt]
+            detail = detail[[col for col in columns if col in detail.columns]].copy()
+        
+            if sel_date in detail.columns:
+                detail[sel_date] = detail[sel_date].dt.strftime('%Y-%m-%d')
+            
+            if detail.empty:
+                st.info('No transactions were found for this selection and period.')
+            else:
+                total_row = {col: '' for col in detail.columns}
+                total_row[CODE] = 'Grand Total'
+                for col in ['Debit', 'Credit', sel_amt]:
+                    total_row[col] = float(detail[col].sum())
                 
-                clicked_column = action.split(':')[1]
-                if clicked_column in [col1_name, col2_name]:
-                    st.session_state.ledger_col = clicked_column
-                else:
-                    st.session_state.ledger_col = col1_name
+                detail = pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
+                st.dataframe(detail, use_container_width=True, hide_index=True,
+                             column_config={col: st.column_config.NumberColumn(format='%.2f')
+                                            for col in ['Debit', 'Credit', sel_amt]})
+            
+                st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
+                                   file_name=f'ledger_{period_label}.csv', mime='text/csv')
 
-    # ========================================================
-    # LEDGER DRILL DOWN SECTION
-    # ========================================================
-    path = st.session_state.ledger_path
-    if path is not None:
-        st.divider()
-        st.subheader('Ledger Details')
-        
-        st.write(f"**Selected scope:** {' → '.join(path)}")
-        
-        if st.session_state.ledger_col not in [col1_name, col2_name]:
-            st.session_state.ledger_col = col1_name
-            
-        selected_col = st.radio('Select the ledger period to view:', [col1_name, col2_name], horizontal=True, key='ledger_col')
-        
-        if selected_col == col1_name:
-            detail = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
-            period_label = col1_name
-        else:
-            detail = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
-            period_label = col2_name
-        
-        mask = detail[MAIN].eq(path[0])
-        if len(path) >= 2: mask &= detail[SUB].eq(path[1])
-        if len(path) == 3: mask &= detail[CODE].eq(path[2])
-        
-        detail = detail.loc[mask].copy()
-        
-        if sel_date in detail.columns:
-            detail = detail.sort_values(sel_date)
-        
-        a, b = st.columns(2)
-        a.metric(f'Transactions · {period_label}', len(detail))
-        b.metric('Original Ledger Net Amount', f'{detail[sel_amt].sum():,.2f}')
-        
-        # Keep unmodified original amounts as requested. Plus is Debit, Minus is Credit.
-        detail['Debit'] = detail[sel_amt].clip(lower=0)
-        detail['Credit'] = -detail[sel_amt].clip(upper=0)
-        
-        st.caption('Net = Debit − Credit.')
-        
-        columns = [CODE, 'Acct Name', MAIN, SUB, 'Title', sel_date, 'Origin', 'Doc No',
-                   'Remarks', 'Offset Acct', 'Offset Acct Name', 'Debit', 'Credit', sel_amt]
-        detail = detail[[col for col in columns if col in detail.columns]].copy()
-        
-        if sel_date in detail.columns:
-            detail[sel_date] = detail[sel_date].dt.strftime('%Y-%m-%d')
-            
-        if detail.empty:
-            st.info('No transactions were found for this selection and period.')
-        else:
-            total_row = {col: '' for col in detail.columns}
-            total_row[CODE] = 'Grand Total'
-            for col in ['Debit', 'Credit', sel_amt]:
-                total_row[col] = float(detail[col].sum())
-                
-            detail = pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
-            st.dataframe(detail, use_container_width=True, hide_index=True,
-                         column_config={col: st.column_config.NumberColumn(format='%.2f')
-                                        for col in ['Debit', 'Credit', sel_amt]})
-            
-            st.download_button('Download Selected Ledger (CSV)', detail.to_csv(index=False).encode('utf-8-sig'),
-                               file_name=f'ledger_{period_label}.csv', mime='text/csv')
-
-    # ========================================================
+        # ========================================================
     # SAVE TO CLOUD (ONLY FOR EDITORS)
     # ========================================================
        # ========================================================
@@ -745,8 +827,8 @@ def run():
                     with st.spinner('Saving workbook and comments online...'):
                         share_token = save_report_snapshot(
                             df, title, st.session_state.draft_comments, 
-                            {'name': col1_name, 'start': str(col1_config['start']) if col1_config['start'] else None, 'end': str(col1_config['end']) if col1_config['end'] else None}, 
-                            {'name': col2_name, 'start': str(col2_config['start']) if col2_config['start'] else None, 'end': str(col2_config['end']) if col2_config['end'] else None},
+                            {'name': col1_name, 'start': str(col1_config['start']) if col1_config['start'] else None, 'end': str(col1_config['end']) if col1_config['end'] else None, 'eps': col1_config.get('eps')}, 
+                            {'name': col2_name, 'start': str(col2_config['start']) if col2_config['start'] else None, 'end': str(col2_config['end']) if col2_config['end'] else None, 'eps': col2_config.get('eps')},
                             sel_date, sel_amt, formula_choice
                         )
                     st.success('Report saved successfully!')
