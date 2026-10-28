@@ -362,12 +362,12 @@ def run():
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.subheader("Column 1 Setup — Latest Period (First)")
-                c1_name = st.text_input("Column 1 Name", value="2026")
+                c1_name = st.text_input("Column 1 Name", value="")
                 c1_start = st.date_input("Start Date (Col 1)", value=None, key='c1s')
                 c1_end = st.date_input("End Date (Col 1)", value=None, key='c1e')
             with c2:
                 st.subheader("Column 2 Setup — Earlier Period (Second)")
-                c2_name = st.text_input("Column 2 Name", value="2025")
+                c2_name = st.text_input("Column 2 Name", value="")
                 c2_start = st.date_input("Start Date (Col 2)", value=None, key='c2s')
                 c2_end = st.date_input("End Date (Col 2)", value=None, key='c2e')
             with c3:
