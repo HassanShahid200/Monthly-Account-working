@@ -19,6 +19,37 @@ REQUIRED_COLUMNS = {"Series", "Due Date", "Remarks", "Doc. No."}
 def normalize_code(series):
     return series.astype('string').str.strip().str.replace(r'\.0$', '', regex=True).replace('', pd.NA)
 
+def parse_ledger_dates(series):
+    """Read SAP dates as day/month/year; keep saved Excel/ISO dates intact.
+
+    Explicit formats prevent ambiguous dates such as 01.04.25 being read
+    as January 4. Unsupported values remain NaT and are reported by the UI.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors='coerce')
+    text = series.astype('string').str.strip()
+    result = pd.Series(pd.NaT, index=series.index, dtype='datetime64[ns]')
+    for fmt in ('%d.%m.%y', '%d.%m.%Y', '%d/%m/%Y', '%d/%m/%y',
+                '%d-%m-%Y', '%d-%m-%y', '%Y-%m-%d',
+                '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f',
+                '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f'):
+        missing = result.isna() & text.notna()
+        if not missing.any():
+            break
+        result.loc[missing] = pd.to_datetime(text.loc[missing], format=fmt, errors='coerce')
+    return result
+
+
+def prepare_report_dates(df, date_col):
+    df = df.copy()
+    df[date_col] = parse_ledger_dates(df[date_col])
+    invalid = int(df[date_col].isna().sum())
+    if invalid:
+        st.warning(f"{invalid:,} transactions have missing or unsupported dates in "
+                   f"{date_col} and will be excluded. Expected SAP format: DD.MM.YY.")
+    return df
+
+
 @st.cache_data
 def load_data(content, filename):
     ext = filename.split('.')[-1].lower()
@@ -67,10 +98,15 @@ def load_mapping(content, filename):
     if SUB not in df.columns: df[SUB] = 'Unclassified'
     if 'Title' not in df.columns: df['Title'] = df['Account code']
         
-    return df[['Account code', MAIN, SUB, 'Title']].dropna(subset=['Account code'])
+    df = df[['Account code', MAIN, SUB, 'Title']].dropna(subset=['Account code']).drop_duplicates()
+    duplicates = df.loc[df['Account code'].duplicated(keep=False), 'Account code'].unique()
+    if len(duplicates):
+        st.error('Conflicting mapping rows for account codes: ' + ', '.join(duplicates.astype(str)))
+        return pd.DataFrame()
+    return df
 
 def filter_by_date(df, date_col, start_date, end_date):
-    mask = pd.Series(True, index=df.index)
+    mask = df[date_col].notna()
     if start_date:
         mask &= (df[date_col].dt.date >= pd.to_datetime(start_date).date())
     if end_date:
@@ -230,10 +266,10 @@ def run():
             col2_config = configs.get('col2', {'name': '2026', 'start': None, 'end': None})
             sel_date = configs.get('sel_date', 'Posting Date')
             sel_amt = configs.get('sel_amt', 'Deb./Cred. (LC)')
-            formula_choice = configs.get('formula', '(Col 2 - Col 1) / Col 2')
+            formula_choice = configs.get('formula', '(Col 2 - Col 1) / Col 1')
             
             if sel_date in df.columns:
-                df[sel_date] = pd.to_datetime(df[sel_date], errors='coerce')
+                df = prepare_report_dates(df, sel_date)
                 
             mode = "Shared View"
             read_only_mode = True
@@ -269,7 +305,7 @@ def run():
         col2_config = {'name': '2026', 'start': None, 'end': None}
         sel_date = 'Posting Date'
         sel_amt = 'Deb./Cred. (LC)'
-        formula_choice = '(Col 2 - Col 1) / Col 2'
+        formula_choice = '(Col 2 - Col 1) / Col 1'
         
         if mode == "Create New Report (Upload Data)":
             st.header("1. Upload Data")
@@ -298,12 +334,12 @@ def run():
             sel_date = c_date.selectbox("Select Date Column", raw_df.columns, index=raw_df.columns.get_loc(date_options[0]) if date_options else 0)
             sel_amt = c_amt.selectbox("Select Amount Column", raw_df.columns, index=raw_df.columns.get_loc(amt_options[0]) if amt_options else 0)
                 
-            df = pd.merge(raw_df, mapping_df, left_on=CODE, right_on='Account code', how='inner')
+            df = pd.merge(raw_df, mapping_df, left_on=CODE, right_on='Account code', how='inner', validate='many_to_one')
             if df.empty:
                 st.error('No matching accounts found between the raw ledger and your mapping file.')
                 return
             
-            df[sel_date] = pd.to_datetime(df[sel_date], errors='coerce')
+            df = prepare_report_dates(df, sel_date)
             if df[sel_amt].dtype == 'object':
                 df[sel_amt] = pd.to_numeric(df[sel_amt].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
             else:
@@ -326,14 +362,16 @@ def run():
             with c3:
                 st.subheader("Formula Setup")
                 formula_choice = st.selectbox("Select % Change Formula", [
-                    "(Col 2 - Col 1) / Col 2",
-                    "(Col 2 - Col 1) / Col 1"
+                    "(Col 2 - Col 1) / Col 1",
+                    "(Col 2 - Col 1) / Col 2"
                 ])
                 
             col1_config = {'name': c1_name, 'start': c1_start, 'end': c1_end}
             col2_config = {'name': c2_name, 'start': c2_start, 'end': c2_end}
 
             st.info(f"Selected Formula: **{formula_choice}**")
+            st.caption("SAP dates use DD.MM.YY. For the screenshot comparison, select Posting Date, "
+                       "Deb./Cred. (LC), and (Col 2 - Col 1) / Col 1.")
             if not st.button("Generate Report", type='primary') and not st.session_state.get('report_generated'):
                 return
             st.session_state.report_generated = True
@@ -361,7 +399,7 @@ def run():
                             st.session_state.loaded_col2_config = configs.get('col2')
                             st.session_state.loaded_sel_date = configs.get('sel_date', 'Posting Date')
                             st.session_state.loaded_sel_amt = configs.get('sel_amt', 'Deb./Cred. (LC)')
-                            st.session_state.loaded_formula = configs.get('formula', '(Col 2 - Col 1) / Col 2')
+                            st.session_state.loaded_formula = configs.get('formula', '(Col 2 - Col 1) / Col 1')
                         except:
                             pass
                             
@@ -371,7 +409,7 @@ def run():
                 sel_amt = st.session_state.get('loaded_sel_amt', sel_amt)
                 
                 if sel_date in df.columns:
-                    df[sel_date] = pd.to_datetime(df[sel_date], errors='coerce')
+                    df = prepare_report_dates(df, sel_date)
                 st.success("Report loaded successfully!")
                 
                 col1_config = st.session_state.get('loaded_col1_config', col1_config)
@@ -386,6 +424,17 @@ def run():
     col1_name = col1_config['name']
     col2_name = col2_config['name']
     
+    reserved = {MAIN, SUB, CODE, 'Title', 'Hierarchy', '% Change', 'Comments',
+                '_level', '_path', '_expanded', '_action', '_id'}
+    if (not col1_name.strip() or not col2_name.strip() or col1_name == col2_name
+            or col1_name in reserved or col2_name in reserved):
+        st.error('Choose two different, non-empty period names that are not ledger column names.')
+        return
+    for config in (col1_config, col2_config):
+        if config['start'] and config['end'] and pd.Timestamp(config['start']) > pd.Timestamp(config['end']):
+            st.error(f"Start date must be on or before end date for {config['name']}.")
+            return
+
     df_col1 = filter_by_date(df, sel_date, col1_config['start'], col1_config['end'])
     df_col2 = filter_by_date(df, sel_date, col2_config['start'], col2_config['end'])
     
